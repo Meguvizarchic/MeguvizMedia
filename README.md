@@ -1,4 +1,22 @@
+<div align="center">
+
+<img src="docs/brand/MeguvizMedia.svg" width="96" height="96" alt="MeguvizMedia">
+
 # MeguvizMedia
+
+**C++17 帧 / 时间线处理与 RIFE effect 库**
+
+C ABI · identity / RIFE · Android AHB 管线
+
+<br>
+
+[![License](https://img.shields.io/badge/license-GPL--3.0-00AEEC?style=flat-square&labelColor=2d3a55)](LICENSE)
+[![Language](https://img.shields.io/badge/lang-C%2B%2B-DEA584?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizMedia)
+[![Issues](https://img.shields.io/github/issues/Meguvizarchic/MeguvizMedia?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizMedia/issues)
+
+</div>
+
+---
 
 当前提供可运行的 C++17 帧/时间线 core、公开 C ABI、单 worker identity effect、可选 RIFE SPI adapter、可安装静态 SDK、显式加载的 Android API/JNI 库及独立图像处理样例。总目标仍为 `bil-rife-ncnn-android`；当前构建产物的适用范围为 CPU/reference，详见 `STATUS.json`。
 
