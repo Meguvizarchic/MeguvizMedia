@@ -28,6 +28,16 @@ typedef struct MgmColor {
     uint32_t premultiplied;
     uint32_t reserved;
 } MgmColor;
+/* Algorithm diagnostics are immutable payload bound to this output frame.
+ * Core transports them without interpreting model-specific measurements. */
+enum { MGM_DIAGNOSTICS_NONE=0,MGM_DIAGNOSTICS_RIFE_LEGACY=1 };
+typedef struct MgmAlgorithmDiagnostics {
+    MgcHeader header;
+    uint32_t schema;
+    /* RIFE_LEGACY: unreliable permille, patch count, histogram permille, scale. */
+    uint32_t values[4];
+    int64_t stage_ns[3];
+} MgmAlgorithmDiagnostics;
 typedef struct MgmFrameDesc {
     MgcHeader header;
     MgcLease *content;
@@ -43,6 +53,13 @@ typedef struct MgmFrameDesc {
     uint32_t frame_kind;
     uint32_t required_flags;
     uint32_t reserved[3];
+    MgmAlgorithmDiagnostics diagnostics;
+    uint64_t source_id,source_id_after,task_id;
+    int64_t duration_ticks;
+    int64_t worker_cpu_ns;
+    uint32_t worker_cpu_observed,reserved_tail;
+    uint64_t gpu_elapsed_ns,gpu_batch_count,gpu_observed_batch_count;
+    uint32_t gpu_elapsed_observed,gpu_timestamp_valid_bits,gpu_timestamp_period_bits,batch_event_coverage_observed;
 } MgmFrameDesc;
 typedef struct MgmClockMapping {
     MgcHeader header;
@@ -64,6 +81,13 @@ typedef struct MgmEffectRequest {
     int64_t deadline_cpu_ns;
     uint32_t required_flags;
     uint32_t reserved[3];
+    /* Optional effect-specific scale (0=plan policy); RIFE adapter accepts 4/6/8
+     * only when its immutable plan enables adaptive flow. Each optional field
+     * must be absent or fully present; partial fields return INVALID_ARGUMENT. */
+    uint32_t algorithm_scale;
+    uint32_t output_sync_mode;
+    /* Uses submit's retained context; real Compute batch observations only. */
+    MgcBatchEventFn batch_event;
 } MgmEffectRequest;
 typedef void (*MgmEffectCompletionFn)(void *context, uint64_t request_id, MgcStatus status, MgmFrame *owned_output);
 typedef struct MgmEffectApi {

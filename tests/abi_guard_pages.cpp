@@ -2,6 +2,7 @@
 #include <meguviz/timeline.h>
 #include "descriptor_pages.h"
 #include <atomic>
+#include <utility>
 static std::atomic<int> callbacks{0};
 void completed(void*,uint64_t id,MgcStatus status,MgmFrame *output){CHECK(id==73&&status==MGC_SUCCESS&&output);mgm_frame_release(output);++callbacks;}
 void unexpected(void*,uint64_t,MgcStatus,MgmFrame*){CHECK(false);}
@@ -32,6 +33,27 @@ int main(){
     CHECK(api.query(effect,short_value.as<MgcCapability>())==MGC_INVALID_ARGUMENT);DescriptorPages capability_prefix(offsetof(MgcCapability,reserved));CHECK(api.query(effect,capability_prefix.as<MgcCapability>())==MGC_SUCCESS);CHECK(capability_prefix.read<MgcCapability>().enabled==1);
     auto capability=init<MgcCapability>();capability.header.abi_major=1;capability_prefix.store(capability);CHECK(api.query(effect,capability_prefix.as<MgcCapability>())==MGC_UNSUPPORTED_ABI);
     auto request=init<MgmEffectRequest>();request.request_id=73;request.epoch=1;request.left=frame;DescriptorPages request_prefix(offsetof(MgmEffectRequest,reserved));request_prefix.store(request);mgm_frame_retain(frame);CHECK(api.submit(effect,request_prefix.as<MgmEffectRequest>(),completed,nullptr,nullptr,nullptr)==MGC_ACCEPTED);CHECK(api.drain(effect,2000000000)==MGC_SUCCESS&&callbacks==1);
+    const std::pair<size_t,size_t> request_fields[]={
+        {offsetof(MgmEffectRequest,reserved),sizeof(uint32_t)},
+        {offsetof(MgmEffectRequest,reserved)+sizeof(uint32_t),sizeof(uint32_t)},
+        {offsetof(MgmEffectRequest,reserved)+2*sizeof(uint32_t),sizeof(uint32_t)},
+        {offsetof(MgmEffectRequest,algorithm_scale),sizeof(request.algorithm_scale)},
+        {offsetof(MgmEffectRequest,output_sync_mode),sizeof(request.output_sync_mode)},
+        {offsetof(MgmEffectRequest,batch_event),sizeof(request.batch_event)}};
+    for(auto field:request_fields)for(size_t cut=1;cut<field.second;++cut){
+        DescriptorPages partial(field.first+cut);partial.store(request);
+        CHECK(api.submit(effect,partial.as<MgmEffectRequest>(),unexpected,nullptr,nullptr,nullptr)==MGC_INVALID_ARGUMENT);
+    }
+    CHECK(api.drain(effect,0)==MGC_SUCCESS&&callbacks==1);
+    const size_t valid_ends[]={offsetof(MgmEffectRequest,algorithm_scale),
+        offsetof(MgmEffectRequest,algorithm_scale)+sizeof(request.algorithm_scale),
+        offsetof(MgmEffectRequest,output_sync_mode)+sizeof(request.output_sync_mode),
+        offsetof(MgmEffectRequest,batch_event)+sizeof(request.batch_event)};
+    for(size_t n=0;n<sizeof(valid_ends)/sizeof(valid_ends[0]);++n){
+        DescriptorPages complete(valid_ends[n]);complete.store(request);mgm_frame_retain(frame);
+        CHECK(api.submit(effect,complete.as<MgmEffectRequest>(),completed,nullptr,nullptr,nullptr)==MGC_ACCEPTED);
+        CHECK(api.drain(effect,2000000000)==MGC_SUCCESS&&callbacks==int(n)+2);
+    }
     request.required_flags=1;request_prefix.store(request);CHECK(api.submit(effect,request_prefix.as<MgmEffectRequest>(),unexpected,nullptr,nullptr,nullptr)==MGC_UNSUPPORTED_ABI);request.required_flags=0;request.reserved[0]=1;CHECK(api.submit(effect,&request,unexpected,nullptr,nullptr,nullptr)==MGC_INVALID_ARGUMENT);
     auto invalid_api=init<MgmEffectApi>();invalid_api.required_flags=1;MgmEffect *rejected_effect=nullptr;CHECK(mgm_identity_effect_create(domain,&rejected_effect,&invalid_api)==MGC_UNSUPPORTED_ABI&&!rejected_effect);invalid_api.required_flags=0;invalid_api.reserved[0]=1;CHECK(mgm_identity_effect_create(domain,&rejected_effect,&invalid_api)==MGC_INVALID_ARGUMENT&&!rejected_effect);
     auto config=init<MgmPlannerConfig>();config.target_fps=60;config.frame_window=4;config.max_clock_age_ns=250000000;config.max_clock_uncertainty_us=2000;DescriptorPages config_prefix(offsetof(MgmPlannerConfig,required_flags)+sizeof(uint32_t));config_prefix.store(config);CHECK(mgm_planner_create(config_prefix.as<MgmPlannerConfig>(),&planner)==MGC_SUCCESS);

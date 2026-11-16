@@ -1,0 +1,102 @@
+// This harness executes extracted production JNI completion and polling code.
+// It uses controlled host stubs, not Android, Vulkan, EGL, or real GPU work.
+#include <meguviz/media_android.h>
+#include <meguviz/media_rife.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cstdio>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using jlong=long long;using jint=int;using jclass=void*;using jlongArray=std::vector<jlong>*;
+struct JNIEnv {};
+struct JniGuard {};
+#define JNIEXPORT
+#define JNICALL
+#define JNI(name) name
+#define SYS_gettid 0
+static int64_t clock_now=100;
+static int released=0,admission_success=-1;
+static MgcStatus domain_query_status=MGC_SUCCESS;
+static bool domain_lost=false;
+int64_t now(){return clock_now;}
+long syscall(long){return 42;}
+struct MgmFrame {};
+extern "C" {
+void mgm_frame_release(MgmFrame *f){if(f)++released;}
+MgcStatus mgm_frame_describe(MgmFrame *f,MgmFrameDesc *d){if(!f)return MGC_INVALID_ARGUMENT;d->frame_kind=MGM_FRAME_INFERRED;d->epoch=1;return MGC_SUCCESS;}
+MgcStatus mgc_lease_info(MgcLease*,MgcLeaseInfo*){return MGC_INVALID_ARGUMENT;}
+MgcStatus mgm_admission_retire(MgmAdmission*,uint64_t,uint32_t ok){admission_success=int(ok);return MGC_SUCCESS;}
+MgcStatus mgm_android_session_close(MgmAndroidSession*){return MGC_SUCCESS;}
+MgcStatus mgm_identity_effect_release(MgmEffect*){return MGC_SUCCESS;}
+MgcStatus mgm_rife_effect_release(MgmEffect*){return MGC_SUCCESS;}
+void mgc_domain_release(MgcDomain*){}
+MgcStatus mgc_domain_state(MgcDomain*,MgcDomainStateInfo* state){if(domain_query_status)return domain_query_status;state->lost=domain_lost;return MGC_SUCCESS;}
+MgcStatus mgc_runtime_close(MgcRuntime*){return MGC_SUCCESS;}
+void mgc_runtime_release(MgcRuntime*){}
+void mgm_admission_release(MgmAdmission*){}
+}
+@SESSION_AND_REGISTRY@
+jlongArray values(JNIEnv*,std::initializer_list<jlong> v){return new std::vector<jlong>(v);}
+@OBSERVATION_AND_COMPLETION@
+struct RawFrameReservation{explicit RawFrameReservation(Session&){}explicit operator bool()const{return true;}void retain(MgmFrame*& frame){mgm_frame_release(frame);frame=nullptr;}};
+static MgcStatus request_frame_release(Session&,jlong){return MGC_ACCEPTED;}
+static void request_java_retirement(JNIEnv*){}
+@RETAIN_UNPUBLISHED_FRAME@
+@POLL_COMPLETED@
+
+static void run_case(MgcStatus incoming,bool cancelled,bool expired,bool stale_before,bool stale_after,
+                     MgcStatus expected,bool expect_queue,bool has_output){
+    auto s=std::make_shared<Session>();s->event_enabled=true;s->identity=true;s->domain=reinterpret_cast<MgcDomain*>(1);s->admission=reinterpret_cast<MgmAdmission*>(1);domain_query_status=MGC_SUCCESS;domain_lost=false;
+    const jlong id=88;{std::lock_guard<std::mutex> lock(mutex);sessions.emplace(id,s);}
+    constexpr uint64_t job_id=7;
+    s->jobs.emplace(job_id,Session::Job{1,50,expired?99:200,cancelled});
+    if(stale_before)s->epoch=2;
+    MgmFrame output;released=0;admission_success=-1;
+    AsyncContext ctx;ctx.session=s;
+    async_completed(&ctx,job_id,incoming,has_output?&output:nullptr);
+    assert(s->device_lost.load()==(incoming==MGC_DEVICE_LOST));
+    if(incoming==MGC_DEVICE_LOST){s->domain=reinterpret_cast<MgcDomain*>(1);domain_query_status=MGC_INTERNAL_ERROR;assert(session_device_loss(*s)==MGC_DEVICE_LOST);domain_query_status=MGC_SUCCESS;s->domain=nullptr;}
+    assert(s->jobs.empty());assert(s->ready_count==(expect_queue?1u:0u));
+    assert(s->event_count>=1);assert(s->events[0].value.kind==MGM_EVENT_EXECUTION_RETIRED);
+    assert(s->events[0].value.result_status==incoming);
+    if(incoming==MGC_DEVICE_LOST){
+        assert(s->event_count==1);assert(s->events[0].value.result_status==MGC_DEVICE_LOST);
+    }
+    if(stale_after)s->epoch=2;
+    JNIEnv env;auto result=androidPollCompleted(&env,nullptr,id);assert(result);
+    assert((*result)[0]==expected);delete result;
+    const bool published=expect_queue&&!stale_after&&expected==MGC_SUCCESS;
+    assert(released==(has_output&&!published?1:0));
+    assert(admission_success==(published?1:0));
+    if(published){assert(s->frames.size()==1);s->frames.clear();}
+    {std::lock_guard<std::mutex> lock(mutex);sessions.erase(id);}
+    s->admission=nullptr;s->domain=nullptr;
+}
+int main(){
+    {
+        Session s;s.domain=reinterpret_cast<MgcDomain*>(1);
+        domain_lost=false;domain_query_status=MGC_SUCCESS;assert(session_device_loss(s)==MGC_SUCCESS);
+        domain_query_status=MGC_INTERNAL_ERROR;assert(session_device_loss(s)==MGC_INTERNAL_ERROR);
+        domain_query_status=MGC_SUCCESS;domain_lost=true;assert(session_device_loss(s)==MGC_DEVICE_LOST);
+        domain_lost=false;assert(session_device_loss(s)==MGC_DEVICE_LOST);
+        s.domain=nullptr;
+    }
+    run_case(MGC_DEVICE_LOST,true,false,false,false,MGC_DEVICE_LOST,true,true);
+    run_case(MGC_DEVICE_LOST,false,true,false,false,MGC_DEVICE_LOST,true,true);
+    run_case(MGC_DEVICE_LOST,true,true,false,false,MGC_DEVICE_LOST,true,false);
+    run_case(MGC_SUCCESS,true,false,false,false,MGC_CANCELLED,true,true);
+    run_case(MGC_SUCCESS,false,true,false,false,MGC_DEADLINE_REJECTED,true,true);
+    run_case(MGC_INTERNAL_ERROR,true,false,false,false,MGC_CANCELLED,true,true);
+    run_case(MGC_INTERNAL_ERROR,false,true,false,false,MGC_DEADLINE_REJECTED,true,true);
+    run_case(MGC_SUCCESS,false,false,false,false,MGC_SUCCESS,true,true);
+    run_case(MGC_DEVICE_LOST,true,true,true,false,MGC_BUSY,false,true);
+    run_case(MGC_DEVICE_LOST,false,false,false,true,MGC_CANCELLED,true,true);
+    std::puts("PASS: production callback and poll with controlled host stubs");
+}

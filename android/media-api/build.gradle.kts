@@ -2,7 +2,9 @@ plugins { id("com.android.library") }
 android {
     namespace = "io.github.jichuo1.meguviz.media.api"
     compileSdk = 37
-    defaultConfig { minSdk = 27 }
+    defaultConfig { minSdk = 27; consumerProguardFiles("consumer-rules.pro") }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }
 androidComponents.onVariants { variant -> variant.sources.java?.addStaticSourceDirectory(file("../../bindings/android/src/main/java").absolutePath) }
+
+dependencies { testImplementation("junit:junit:4.13.2") }

@@ -19,7 +19,7 @@ def run(name,argv):
     if p.returncode:raise RuntimeError(name+" failed; inspect raw evidence")
     return p.stdout.decode("utf-8",errors="replace")
 sha=lambda b:hashlib.sha256(b).hexdigest()
-approved={"Java_io_github_jichuo1_meguviz_media_MediaNative_abiVersion","Java_io_github_jichuo1_meguviz_media_MediaNative_identityRgb"}
+approved={"Java_io_github_jichuo1_meguviz_media_MediaNative_abiVersion","Java_io_github_jichuo1_meguviz_media_MediaNative_identityRgb","meguviz_code_image_anchor_v1"}
 payload=[]
 with zipfile.ZipFile(aar) as package,zipfile.ZipFile(api) as api_package:
     if any(n.endswith(".so") for n in api_package.namelist()):raise RuntimeError("API-only AAR contains a native owner")

@@ -1,6 +1,11 @@
 {
   global:
+    meguviz_code_image_anchor_v1;
     Java_io_github_jichuo1_meguviz_media_MediaNative_abiVersion;
     Java_io_github_jichuo1_meguviz_media_MediaNative_identityRgb;
+    Java_io_github_jichuo1_meguviz_media_MediaPlanner_*;
+    Java_io_github_jichuo1_meguviz_media_MediaCadence_*;
+    Java_io_github_jichuo1_meguviz_media_MediaVsyncGrid_*;
+    Java_io_github_jichuo1_meguviz_media_MediaVsyncMeter_*;
   local: *;
 };

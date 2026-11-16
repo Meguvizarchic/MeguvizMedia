@@ -14,6 +14,24 @@ public final class MediaRuntime {
         attachAlreadyLoaded();
     }
 
+    public static synchronized void loadPackaged() {
+        System.loadLibrary("meguviz_media_rife_ncnn");
+        attachAlreadyLoaded();
+    }
+
+    public static boolean isAttached() { return attached; }
+    /** Configuration belongs to the engine and is copied into every later CPU
+     * bridge or AHB effect plan. Recreate existing AndroidMediaSession objects
+     * after draining them when changing a live engine's configuration. */
+    public static int frameSetOptimizationFlags(long engine, int flags) {
+        if (!attached) return 7;
+        return MediaNative.frameSetOptimizationFlags(engine, flags);
+    }
+    public static int frameSetShaderpack(long engine, String rootDir, String canonicalManifestHash, String bindingsJson) {
+        if (!attached) return 7;
+        return MediaNative.frameSetShaderpack(engine, rootDir, canonicalManifestHash, bindingsJson);
+    }
+
     /** The host validates artifact size/hash/receipt before invoking this method. */
     public static synchronized void loadValidatedAbsolutePath(String library) throws IOException {
         File file = new File(library);

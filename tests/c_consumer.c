@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mxcsr_daz.h"
 #ifdef _WIN32
 #include <windows.h>
 typedef DWORD ThreadId;
@@ -24,6 +25,14 @@ int main(void){
     INIT(ld,MgcLeaseDesc);ld.content_id=7;ld.byte_length=12;ld.access=MGC_ACCESS_WRITE;CHECK(mgc_lease_create(resource,&ld,&write)==MGC_SUCCESS);CHECK(mgc_lease_map(write,&data,&size)==MGC_SUCCESS&&size==12);memset(data,83,12);CHECK(mgc_lease_unmap(write)==MGC_SUCCESS);mgc_lease_release(write);ld.access=MGC_ACCESS_READ;CHECK(mgc_lease_create(resource,&ld,&read)==MGC_SUCCESS);
     INIT(fd,MgmFrameDesc);fd.content=read;fd.pts_ticks=45000;fd.timebase.numerator=1;fd.timebase.denominator=90000;fd.epoch=1;fd.crop_width=2;fd.crop_height=2;fd.frame_kind=MGM_FRAME_ORIGINAL;fd.color.header=(MgcHeader)MGC_HEADER_INIT(MgmColor);fd.color.transfer=MGM_TRANSFER_SDR;fd.color.bit_depth=8;fd.color.range=MGM_RANGE_FULL;CHECK(mgm_frame_create(&fd,&frame)==MGC_SUCCESS);
     INIT(api,MgmEffectApi);CHECK(mgm_identity_effect_create(domain,&effect,&api)==MGC_SUCCESS);INIT(req,MgmEffectRequest);req.request_id=73;req.epoch=1;req.left=frame;req.alpha=0;c.caller=THREAD_ID;c.effect=effect;c.api=&api;
+#if defined(MGM_TEST_X86_DAZ)
+    if(mgm_test_has_daz_ftz()){uint64_t bits=UINT64_C(0x8000000000000001);unsigned previous;MgcStatus status;
+     memcpy(&req.alpha,&bits,sizeof(bits));mgm_frame_retain(frame);previous=_mm_getcsr();_mm_setcsr(previous|0x8040u);
+     status=api.submit(effect,&req,completed,&c,retain,release);_mm_setcsr(previous);
+     if(status==MGC_ACCEPTED){CHECK(api.drain(effect,2000000000)==MGC_SUCCESS);if(c.output){mgm_frame_release(c.output);c.output=0;}}
+     else mgm_frame_release(frame);
+     CHECK(status==MGC_INVALID_ARGUMENT&&c.count==0&&c.refs==0);req.alpha=0;}
+#endif
     req.required_flags=1;CHECK(api.submit(effect,&req,completed,&c,retain,release)==MGC_UNSUPPORTED_ABI);req.required_flags=0;mgm_frame_retain(frame);CHECK(api.submit(effect,&req,completed,&c,retain,release)==MGC_ACCEPTED);CHECK(api.drain(effect,2000000000)==MGC_SUCCESS);CHECK(c.count==1&&c.refs==0);
     INIT(fd,MgmFrameDesc);CHECK(mgm_frame_describe(c.output,&fd)==MGC_SUCCESS&&fd.pts_ticks==45000&&fd.frame_kind==MGM_FRAME_ORIGINAL);
     CHECK(mgm_identity_effect_release(effect)==MGC_SUCCESS);mgm_frame_release(frame);mgc_lease_release(read);mgc_resource_release(resource);mgc_domain_release(domain);CHECK(mgc_runtime_close(runtime)==MGC_BUSY);CHECK(mgc_lease_map(fd.content,&data,&size)==MGC_SUCCESS&&size==12&&((unsigned char*)data)[11]==83);CHECK(mgc_lease_unmap(fd.content)==MGC_SUCCESS);mgm_frame_release(c.output);CHECK(mgc_runtime_close(runtime)==MGC_SUCCESS);mgc_runtime_release(runtime);

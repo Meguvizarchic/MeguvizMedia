@@ -1,5 +1,7 @@
 #include <meguviz/media.h>
+#include "../alpha.hpp"
 #include "../descriptor.h"
+#include "../frame_private.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -10,7 +12,6 @@
 #include <new>
 #include <thread>
 
-struct MgmFrame { std::atomic<uint32_t> refs{1};MgmFrameDesc desc{}; };
 struct MgmTimeline { std::mutex mutex;MgmClockMapping mapping{}; };
 struct Job { MgmEffectRequest request{};MgmEffectCompletionFn callback=nullptr;void *context=nullptr;MgcContextFn release_context=nullptr;bool cancelled=false; };
 struct MgmEffect {
@@ -45,13 +46,12 @@ MgcStatus prepare(MgmEffect *effect,const MgmFrameDesc *format) {
     if(!effect)return MGC_INVALID_ARGUMENT;MgmFrameDesc value{};auto status=copy_desc(format,offsetof(MgmFrameDesc,reserved),value);if(status)return status;return value.required_flags?MGC_UNSUPPORTED_ABI:(!zero(value.reserved)?MGC_INVALID_ARGUMENT:MGC_SUCCESS);
 }
 MgcStatus submit(MgmEffect *e,const MgmEffectRequest *r,MgmEffectCompletionFn cb,void *ctx,MgcContextFn retain,MgcContextFn release) {
-    if(!e||!cb)return MGC_INVALID_ARGUMENT;MgmEffectRequest copied{};auto status=copy_desc(r,offsetof(MgmEffectRequest,reserved),copied);if(status)return status;r=&copied;if(r->required_flags)return MGC_UNSUPPORTED_ABI;if(!zero(r->reserved))return MGC_INVALID_ARGUMENT;
-    if(!valid_frame(r->left)||!std::isfinite(r->alpha)||r->alpha<0||r->alpha>1||(r->right&&!valid_frame(r->right))||r->left->desc.epoch!=r->epoch||(r->right&&r->right->desc.epoch!=r->epoch)||!!retain!=!!release)return MGC_INVALID_ARGUMENT;
+    if(!e||!cb)return MGC_INVALID_ARGUMENT;MgmEffectRequest copied{};uint32_t request_size=0;auto status=copy_desc(r,offsetof(MgmEffectRequest,reserved),copied,&request_size);if(status)return status;if(!mgm_detail::effect_request_prefix_complete(request_size))return MGC_INVALID_ARGUMENT;r=&copied;if(r->required_flags)return MGC_UNSUPPORTED_ABI;if(!zero(r->reserved))return MGC_INVALID_ARGUMENT;
+    if(!valid_frame(r->left)||!mgm_detail::valid_alpha(r->alpha)||(r->right&&!valid_frame(r->right))||r->left->desc.epoch!=r->epoch||(r->right&&r->right->desc.epoch!=r->epoch)||!!retain!=!!release)return MGC_INVALID_ARGUMENT;
     uint64_t domain_id=0,generation=0;if(mgc_domain_identity(e->domain,&domain_id,&generation))return MGC_INVALID_ARGUMENT;
     MgcLeaseInfo info{};info.header=MGC_HEADER_INIT(MgcLeaseInfo);if(mgc_lease_info(r->left->desc.content,&info))return MGC_INVALID_ARGUMENT;
     if(info.domain_id!=domain_id||info.domain_generation!=generation)return MGC_INCOMPATIBLE_DOMAIN;
     if(r->right){if(mgc_lease_info(r->right->desc.content,&info))return MGC_INVALID_ARGUMENT;if(info.domain_id!=domain_id||info.domain_generation!=generation)return MGC_INCOMPATIBLE_DOMAIN;}
-    MgcCapability cap{};cap.header=MGC_HEADER_INIT(MgcCapability);if(mgc_domain_capability(e->domain,MGC_CAP_CPU_REFERENCE,&cap)||!cap.enabled)return MGC_UNSUPPORTED_CAPABILITY;
     try {
         auto job=std::make_unique<Job>();job->request=*r;job->callback=cb;job->context=ctx;job->release_context=release;
         // Reserve lifetime and capacity before calling user code; do not call
@@ -91,14 +91,20 @@ MgcStatus drain(MgmEffect *e,uint64_t timeout_ns) {
 }
 extern "C" {
 MgcStatus mgm_frame_create(const MgmFrameDesc *d,MgmFrame **out) {
-    if(out)*out=nullptr;if(!out)return MGC_INVALID_ARGUMENT;MgmFrameDesc copied{};auto s=copy_desc(d,offsetof(MgmFrameDesc,reserved),copied);if(s)return s;d=&copied;if(d->required_flags)return MGC_UNSUPPORTED_ABI;if(!zero(d->reserved))return MGC_INVALID_ARGUMENT;
+    if(out)*out=nullptr;if(!out)return MGC_INVALID_ARGUMENT;MgmFrameDesc copied{};auto s=copy_desc(d,offsetof(MgmFrameDesc,reserved),copied);if(s)return s;d=&copied;if(d->required_flags)return MGC_UNSUPPORTED_ABI;if(!zero(d->reserved)||d->reserved_tail||d->worker_cpu_observed>1)return MGC_INVALID_ARGUMENT;
+    MgmColor color{};s=mgm_detail::copy_color(d->color,color);if(s)return s;copied.color=color;
     if(!d->content||d->timebase.denominator<=0||d->timebase.numerator<=0||d->pts_ticks<0||d->rotation_degrees%90||d->rotation_degrees>=360)return MGC_INVALID_ARGUMENT;
     MgcLeaseInfo info{};info.header=MGC_HEADER_INIT(MgcLeaseInfo);s=mgc_lease_info(d->content,&info);if(s)return s;
+    if(!(info.access&MGC_ACCESS_READ))return MGC_INVALID_ARGUMENT;
     if(info.width&&(d->crop_left>info.width||d->crop_width>info.width-d->crop_left||d->crop_top>info.height||d->crop_height>info.height-d->crop_top))return MGC_INVALID_ARGUMENT;
     auto f=new(std::nothrow) MgmFrame;if(!f)return MGC_OUT_OF_MEMORY;f->desc=*d;mgc_lease_retain(d->content);*out=f;return MGC_SUCCESS;
 }
 void mgm_frame_retain(MgmFrame *f){if(f)++f->refs;}
-void mgm_frame_release(MgmFrame *f){if(f&&--f->refs==0){mgc_lease_release(f->desc.content);delete f;}}
+void mgm_frame_release(MgmFrame *f){if(f&&--f->refs==0){
+#if defined(MGR_ENABLE_JOB_OBSERVATION)
+    if(f->attachment)f->attachment->destroy(f->attachment);
+#endif
+    mgc_lease_release(f->desc.content);delete f;}}
 MgcStatus mgm_frame_describe(MgmFrame *f,MgmFrameDesc *d){if(!f)return MGC_INVALID_ARGUMENT;MgcHeader h{};auto s=mgm_detail::read_header(d,sizeof(MgcHeader),h);if(s)return s;write_desc(d,f->desc,h.struct_size);return MGC_SUCCESS;}
 MgcStatus mgm_timeline_create(const MgmClockMapping *m,MgmTimeline **out){if(out)*out=nullptr;if(!out)return MGC_INVALID_ARGUMENT;MgmClockMapping copied{};auto s=copy_desc(m,offsetof(MgmClockMapping,reserved),copied);if(s)return s;m=&copied;if(!m->valid||m->timebase.numerator<=0||m->timebase.denominator<=0||!zero(m->reserved))return MGC_INVALID_ARGUMENT;auto t=new(std::nothrow) MgmTimeline;if(!t)return MGC_OUT_OF_MEMORY;t->mapping=*m;*out=t;return MGC_SUCCESS;}
 void mgm_timeline_release(MgmTimeline *t){delete t;}
