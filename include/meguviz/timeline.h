@@ -50,11 +50,20 @@ typedef struct MgmProposal {
     uint32_t mode;
     uint32_t waiting_reason;
 } MgmProposal;
+typedef struct MgmPlannerCounters {
+    MgcHeader header;
+    uint64_t original,interpolate,snapped,no_future,no_previous,skipped_lead,skipped_behind;
+} MgmPlannerCounters;
 /* Config/snapshot require fields through required_flags; proposal and output
- * records require their full current prefix. Future trailing fields are ignored. */
+ * records require their full current prefix. Future trailing fields are ignored.
+ * On successful begin, close and clock operations, discarded.accepted is zero. */
 MGM_API MgcStatus mgm_planner_create(const MgmPlannerConfig *config,MgmPlanner **planner);
 MGM_API void mgm_planner_release(MgmPlanner *planner);
 MGM_API MgcStatus mgm_planner_begin(MgmPlanner *planner,const MgmEpoch *epoch,uint64_t *lease_generation,MgmOfferResult *discarded);
+MGM_API MgcStatus mgm_planner_begin_target(MgmPlanner *planner,const MgmEpoch *epoch,uint32_t target_fps,uint64_t *lease_generation,MgmOfferResult *discarded);
+MGM_API MgcStatus mgm_planner_close_epoch(MgmPlanner *planner,uint64_t lease_generation,MgmOfferResult *discarded);
+MGM_API MgcStatus mgm_planner_effective_delay(MgmPlanner *planner,double speed,uint32_t use_clock_speed,int64_t *delay_us);
+MGM_API MgcStatus mgm_planner_counters(MgmPlanner *planner,MgmPlannerCounters *counters);
 MGM_API MgcStatus mgm_planner_clock(MgmPlanner *planner,uint64_t lease_generation,const MgmClockSnapshot *snapshot,uint32_t *clock_state,MgmOfferResult *discarded);
 MGM_API MgcStatus mgm_planner_offer(MgmPlanner *planner,uint64_t lease_generation,uint64_t frame_id,int64_t pts_us,MgmOfferResult *result);
 MGM_API MgcStatus mgm_planner_plan(MgmPlanner *planner,uint64_t lease_generation,int64_t now_ns,MgmProposal *proposal);

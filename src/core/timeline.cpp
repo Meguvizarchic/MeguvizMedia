@@ -10,9 +10,11 @@
 #include <new>
 #include <optional>
 #include <vector>
+#include <atomic>
 
 namespace {
 constexpr int64_t ns_second=1000000000;
+std::atomic<uint64_t> next_proposal{1};
 bool add(int64_t a,int64_t b,int64_t &v){if((b>0&&a>INT64_MAX-b)||(b<0&&a<INT64_MIN-b))return false;v=a+b;return true;}
 bool sub(int64_t a,int64_t b,int64_t &v){if((b<0&&a>INT64_MAX+b)||(b>0&&a<INT64_MIN+b))return false;v=a-b;return true;}
 bool mul(int64_t a,int64_t b,int64_t &v){if(a<0||b<0)return false;if(b&&a>INT64_MAX/b)return false;v=a*b;return true;}
@@ -29,6 +31,7 @@ struct MgmPlanner {
     std::optional<MgmClockSnapshot> clock;std::optional<int64_t> anchor,last_observed;
     std::optional<MgmProposal> pending;int64_t pending_tick=0,planned_at=0,next_tick=0,phase_offset=0;
     std::vector<Frame> frames;
+    MgmPlannerCounters counters{};
     void reset(MgmOfferResult *discarded){if(discarded){discarded->accepted=0;discarded->discarded_count=uint32_t(frames.size());for(size_t i=0;i<frames.size();++i)discarded->discarded_ids[i]=frames[i].id;}frames.clear();pending.reset();clock.reset();anchor.reset();last_observed.reset();next_tick=0;phase_offset=0;phase_locked=false;active=false;}
     bool current(uint64_t g)const{return active&&generation==g;}
     bool observe(int64_t now){if(last_observed&&now<*last_observed)return false;last_observed=now;return true;}
@@ -38,10 +41,23 @@ struct MgmPlanner {
     MgcStatus valid(const MgmProposal *p,int64_t now){if(!pending||!current(p->lease_generation)||pending->proposal_id!=p->proposal_id)return MGC_CANCELLED;if(!observe(now)||now<planned_at||now>pending->due_ns||!clock||clock->paused)return MGC_CANCELLED;int64_t age;if(!sub(now,clock->monotonic_ns,age)||age<0||age>config.max_clock_age_ns)return MGC_CANCELLED;return MGC_SUCCESS;}
 };
 extern "C" {
-MgcStatus mgm_planner_create(const MgmPlannerConfig *c,MgmPlanner **out){if(out)*out=nullptr;if(!out)return MGC_INVALID_ARGUMENT;MgmPlannerConfig copied{};auto s=copy_desc(c,offsetof(MgmPlannerConfig,required_flags)+sizeof(uint32_t),copied);if(s)return s;c=&copied;if(c->required_flags)return MGC_UNSUPPORTED_ABI;int64_t period=c->target_fps?(ns_second+c->target_fps-1)/c->target_fps:1;if(!fps_ok(c->target_fps)||c->frame_window<4||c->frame_window>12||c->max_clock_age_ns<=0||c->max_clock_age_ns>ns_second||c->presentation_delay_ns<0||c->presentation_delay_ns>250000000||c->max_lead_ns<0||c->max_lead_ns>250000000||c->min_lead_ns<0||c->min_lead_ns>(c->max_lead_ns?c->max_lead_ns:period)||c->original_tolerance_us<0||c->max_clock_uncertainty_us<0||c->max_clock_uncertainty_us>8000||c->phase_lock>1)return MGC_INVALID_ARGUMENT;auto p=new(std::nothrow) MgmPlanner;if(!p)return MGC_OUT_OF_MEMORY;try{p->frames.reserve(c->frame_window);}catch(const std::bad_alloc&){delete p;return MGC_OUT_OF_MEMORY;}p->config=*c;*out=p;return MGC_SUCCESS;}
+MgcStatus mgm_planner_create(const MgmPlannerConfig *c,MgmPlanner **out){if(out)*out=nullptr;if(!out)return MGC_INVALID_ARGUMENT;MgmPlannerConfig copied{};auto s=copy_desc(c,offsetof(MgmPlannerConfig,required_flags)+sizeof(uint32_t),copied);if(s)return s;c=&copied;if(c->required_flags)return MGC_UNSUPPORTED_ABI;int64_t period=c->target_fps?(ns_second+c->target_fps-1)/c->target_fps:999999999;if(!fps_ok(c->target_fps)||c->frame_window<4||c->frame_window>12||c->max_clock_age_ns<=0||c->presentation_delay_ns<0||c->presentation_delay_ns>250000000||c->max_clock_age_ns>INT64_MAX-c->presentation_delay_ns||c->max_lead_ns<0||c->max_lead_ns>250000000||c->min_lead_ns<0||c->min_lead_ns>(c->max_lead_ns?c->max_lead_ns:period)||c->original_tolerance_us<0||c->max_clock_uncertainty_us<0||c->max_clock_uncertainty_us>8000||c->phase_lock>1)return MGC_INVALID_ARGUMENT;auto p=new(std::nothrow) MgmPlanner;if(!p)return MGC_OUT_OF_MEMORY;try{p->frames.reserve(c->frame_window);}catch(const std::bad_alloc&){delete p;return MGC_OUT_OF_MEMORY;}p->config=*c;*out=p;return MGC_SUCCESS;}
 void mgm_planner_release(MgmPlanner *p){delete p;}
+MgcStatus mgm_planner_begin_target(MgmPlanner *p,const MgmEpoch *epoch,uint32_t fps,uint64_t *generation,MgmOfferResult *discarded){
+    if(!p||!epoch||!generation||!fps_ok(fps))return MGC_INVALID_ARGUMENT;auto status=abi(discarded,sizeof(*discarded));if(status)return status;
+    std::lock_guard<std::mutex> lock(p->mutex);p->reset(discarded);p->epoch=*epoch;p->config.target_fps=fps;if(p->generation==UINT64_MAX)return MGC_INTERNAL_ERROR;*generation=++p->generation;p->active=true;return MGC_SUCCESS;
+}
+MgcStatus mgm_planner_close_epoch(MgmPlanner *p,uint64_t generation,MgmOfferResult *discarded){
+    if(!p)return MGC_INVALID_ARGUMENT;auto status=abi(discarded,sizeof(*discarded));if(status)return status;std::lock_guard<std::mutex> lock(p->mutex);discarded->accepted=0;discarded->discarded_count=0;if(p->current(generation))p->reset(discarded);return MGC_SUCCESS;
+}
+MgcStatus mgm_planner_effective_delay(MgmPlanner *p,double speed,uint32_t use_clock,int64_t *delay){
+    if(!p||!delay||use_clock>1)return MGC_INVALID_ARGUMENT;std::lock_guard<std::mutex> lock(p->mutex);if(use_clock)speed=p->clock?p->clock->speed:1.0;int64_t base=0;if(!rounded(double(p->config.presentation_delay_ns)/1000.0*speed,base)||!add(base,p->phase_offset,*delay))return MGC_INVALID_ARGUMENT;return MGC_SUCCESS;
+}
+MgcStatus mgm_planner_counters(MgmPlanner *p,MgmPlannerCounters *out){
+    if(!p)return MGC_INVALID_ARGUMENT;MgcHeader header{};auto status=mgm_detail::read_header(out,sizeof(MgcHeader),header);if(status)return status;std::lock_guard<std::mutex> lock(p->mutex);auto value=p->counters;value.header=MGC_HEADER_INIT(MgmPlannerCounters);mgm_detail::write_desc(out,value,header.struct_size);return MGC_SUCCESS;
+}
 MgcStatus mgm_planner_begin(MgmPlanner *p,const MgmEpoch *epoch,uint64_t *generation,MgmOfferResult *discarded){if(!p||!epoch||!generation)return MGC_INVALID_ARGUMENT;auto status=abi(discarded,sizeof(*discarded));if(status)return status;std::lock_guard<std::mutex> lock(p->mutex);p->reset(discarded);p->epoch=*epoch;if(p->generation==UINT64_MAX)return MGC_INTERNAL_ERROR;*generation=++p->generation;p->active=true;return MGC_SUCCESS;}
-MgcStatus mgm_planner_clock(MgmPlanner *p,uint64_t generation,const MgmClockSnapshot *s,uint32_t *state,MgmOfferResult *discarded){if(!p||!state)return MGC_INVALID_ARGUMENT;auto output_status=abi(discarded,sizeof(*discarded));if(output_status)return output_status;MgmClockSnapshot copied{};if(s){auto status=copy_desc(s,offsetof(MgmClockSnapshot,required_flags)+sizeof(uint32_t),copied);if(status)return status;if(copied.required_flags)return MGC_UNSUPPORTED_ABI;s=&copied;}std::lock_guard<std::mutex> lock(p->mutex);discarded->discarded_count=0;if(!p->current(generation))return MGC_CANCELLED;if(!s){*state=MGM_CLOCK_RESTART_REQUIRED;p->reset(discarded);return MGC_SUCCESS;}
+MgcStatus mgm_planner_clock(MgmPlanner *p,uint64_t generation,const MgmClockSnapshot *s,uint32_t *state,MgmOfferResult *discarded){if(!p||!state)return MGC_INVALID_ARGUMENT;auto output_status=abi(discarded,sizeof(*discarded));if(output_status)return output_status;MgmClockSnapshot copied{};if(s){auto status=copy_desc(s,offsetof(MgmClockSnapshot,required_flags)+sizeof(uint32_t),copied);if(status)return status;if(copied.required_flags)return MGC_UNSUPPORTED_ABI;s=&copied;}std::lock_guard<std::mutex> lock(p->mutex);discarded->accepted=0;discarded->discarded_count=0;if(!p->current(generation))return MGC_CANCELLED;if(!s){*state=MGM_CLOCK_RESTART_REQUIRED;p->reset(discarded);return MGC_SUCCESS;}
     if(s->media_us<0||s->uncertainty_us<0||s->uncertainty_us>p->config.max_clock_uncertainty_us||!std::isfinite(s->speed)||s->speed<0||(!s->paused&&s->speed==0)||s->discontinuity!=p->epoch.discontinuity){*state=MGM_CLOCK_RESTART_REQUIRED;p->reset(discarded);return MGC_SUCCESS;}
     if(p->clock){auto &prev=*p->clock;if(s->monotonic_ns<prev.monotonic_ns){*state=MGM_CLOCK_STALE_SNAPSHOT;return MGC_SUCCESS;}int64_t budget=prev.uncertainty_us+s->uncertainty_us;if(s->speed!=prev.speed||s->paused!=prev.paused||(s->media_us<prev.media_us&&!near(s->media_us,prev.media_us,budget))||(s->monotonic_ns==prev.monotonic_ns&&!near(s->media_us,prev.media_us,budget))){*state=MGM_CLOCK_RESTART_REQUIRED;p->reset(discarded);return MGC_SUCCESS;}}
     if(p->pending){int64_t updated;if(!p->media_at(*s,p->pending->due_ns,updated)||!near(updated,p->pending->media_us,p->pending->uncertainty_us+s->uncertainty_us))p->pending.reset();}
@@ -57,19 +73,31 @@ MgcStatus mgm_planner_offer(MgmPlanner *p,uint64_t generation,uint64_t id,int64_
 }
 MgcStatus mgm_planner_plan(MgmPlanner *p,uint64_t generation,int64_t now,MgmProposal *out){if(!p||!out)return MGC_INVALID_ARGUMENT;auto s=abi(&out->header,sizeof(*out));if(s)return s;std::lock_guard<std::mutex> lock(p->mutex);MgcHeader h=out->header;*out={};out->header=h;out->lease_generation=generation;auto wait=[&](uint32_t reason){out->waiting_reason=reason;return MGC_SUCCESS;};if(!p->current(generation))return wait(MGM_WAIT_STALE_LEASE);if(!p->config.target_fps)return wait(MGM_WAIT_DISABLED);if(!p->clock)return wait(MGM_WAIT_NO_CLOCK);auto clock=*p->clock;if(clock.paused)return wait(MGM_WAIT_PAUSED);if(!p->observe(now))return wait(MGM_WAIT_INVALID_TIME);int64_t age;if(!sub(now,clock.monotonic_ns,age)||age<0)return wait(MGM_WAIT_INVALID_TIME);if(age>p->config.max_clock_age_ns)return wait(MGM_WAIT_STALE_CLOCK);
     if(p->pending){if(now<=p->pending->due_ns){out->due_ns=p->pending->due_ns;out->media_us=p->pending->media_us;return wait(MGM_WAIT_IN_FLIGHT);}p->pending.reset();}
-    int64_t elapsed,tick;if(!p->anchor||!sub(now,*p->anchor,elapsed)||!p->first_tick(elapsed,tick))return wait(MGM_WAIT_INVALID_TIME);p->next_tick=std::max(p->next_tick,tick);auto max_lead=p->config.max_lead_ns?p->config.max_lead_ns:(ns_second+p->config.target_fps-1)/p->config.target_fps;
+    int64_t elapsed,tick;if(!p->anchor||!sub(now,*p->anchor,elapsed)||!p->first_tick(elapsed,tick))return wait(MGM_WAIT_INVALID_TIME);if(tick>p->next_tick&&(p->counters.original||p->counters.interpolate))p->counters.skipped_behind+=uint64_t(tick-p->next_tick);p->next_tick=std::max(p->next_tick,tick);auto max_lead=p->config.max_lead_ns?p->config.max_lead_ns:(ns_second+p->config.target_fps-1)/p->config.target_fps;
     for(int scan=0;scan<8;++scan){int64_t due,ahead,media;if(!p->slot_time(p->next_tick,due)||!sub(due,now,ahead))return wait(MGM_WAIT_INVALID_TIME);out->due_ns=due;if(ahead>max_lead)return wait(MGM_WAIT_AHEAD_OF_WINDOW);
         if(p->config.phase_lock&&!p->phase_locked){int64_t base;if(!p->media_at(clock,due,base))return wait(MGM_WAIT_INVALID_TIME);const Frame *reference=nullptr;for(auto &f:p->frames)if(f.pts<=base)reference=&f;if(!reference){out->media_us=base;return wait(MGM_WAIT_NO_PREVIOUS);}p->phase_offset=base-reference->pts;p->phase_locked=true;}
         if(!p->media_at(clock,due,media))return wait(MGM_WAIT_INVALID_TIME);
         const Frame *nearest=nullptr;int64_t nearest_distance=INT64_MAX;for(auto &f:p->frames){int64_t distance;if(sub(std::max(f.pts,media),std::min(f.pts,media),distance)&&distance<nearest_distance){nearest=&f;nearest_distance=distance;}}
-        if(p->config.phase_lock&&nearest&&nearest->pts!=media){double period=1000000.0*clock.speed/p->config.target_fps;int64_t correction,lower;if(nearest_distance<period/2&&sub(media,nearest->pts,correction)&&add(p->phase_offset,correction,correction)&&rounded(period,lower)&&correction>=-lower&&correction<=100000){p->phase_offset=correction;media=nearest->pts;nearest_distance=0;}}
-        out->media_us=media;const Frame *exact=nearest&&nearest_distance<=p->config.original_tolerance_us?nearest:nullptr;const Frame *before=exact,*after=exact;if(!exact){for(auto &f:p->frames){if(f.pts<media)before=&f;if(f.pts>media&&!after)after=&f;}}if(!before)return wait(MGM_WAIT_NO_PREVIOUS);if(!after)return wait(MGM_WAIT_NO_FUTURE);
+        if(p->config.phase_lock&&nearest&&nearest->pts!=media){double period=1000000.0*clock.speed/p->config.target_fps;int64_t correction,lower;if(nearest_distance<period/2&&sub(media,nearest->pts,correction)&&add(p->phase_offset,correction,correction)&&rounded(period,lower)&&correction>=-lower&&correction<=100000){p->phase_offset=correction;media=nearest->pts;nearest_distance=0;++p->counters.snapped;}}
+        out->media_us=media;const Frame *exact=nearest&&nearest_distance<=p->config.original_tolerance_us?nearest:nullptr;const Frame *before=exact,*after=exact;if(!exact){for(auto &f:p->frames){if(f.pts<media)before=&f;if(f.pts>media&&!after)after=&f;}}if(!before){++p->counters.no_previous;return wait(MGM_WAIT_NO_PREVIOUS);}if(!after){++p->counters.no_future;return wait(MGM_WAIT_NO_FUTURE);}
         const Frame *selected=exact;double period=std::ceil(1000000.0*clock.speed/p->config.target_fps);if(!selected&&double(after->pts-before->pts)<=period)selected=media-before->pts<=after->pts-media?before:after;
-        if(!selected&&ahead<p->config.min_lead_ns){if(p->next_tick==INT64_MAX)return wait(MGM_WAIT_INVALID_TIME);++p->next_tick;continue;}
-        out->proposal_id=++p->proposal_sequence;out->before_id=selected?selected->id:before->id;out->after_id=selected?selected->id:after->id;out->alpha=selected?0.0:double(media-before->pts)/double(after->pts-before->pts);out->uncertainty_us=clock.uncertainty_us;out->mode=selected?MGM_FRAME_ORIGINAL:MGM_FRAME_INFERRED;p->pending=*out;p->pending_tick=p->next_tick;p->planned_at=now;return MGC_SUCCESS;
-    }return wait(MGM_WAIT_AHEAD_OF_WINDOW);
+        if(!selected&&ahead<p->config.min_lead_ns){if(p->next_tick==INT64_MAX)return wait(MGM_WAIT_INVALID_TIME);++p->counters.skipped_lead;++p->next_tick;continue;}
+        out->proposal_id=next_proposal.fetch_add(1);if(!out->proposal_id)return MGC_INTERNAL_ERROR;out->before_id=selected?selected->id:before->id;out->after_id=selected?selected->id:after->id;out->alpha=selected?0.0:double(media-before->pts)/double(after->pts-before->pts);out->uncertainty_us=clock.uncertainty_us;out->mode=selected?MGM_FRAME_ORIGINAL:MGM_FRAME_INFERRED;if(selected)++p->counters.original;else ++p->counters.interpolate;p->pending=*out;p->pending_tick=p->next_tick;p->planned_at=now;return MGC_SUCCESS;
+    }if(!p->slot_time(p->next_tick,out->due_ns))out->due_ns=0;out->media_us=0;return wait(MGM_WAIT_AHEAD_OF_WINDOW);
 }
 MgcStatus mgm_planner_valid(MgmPlanner *p,const MgmProposal *proposal,int64_t now){if(!p)return MGC_INVALID_ARGUMENT;MgmProposal value{};auto s=copy_desc(proposal,sizeof(*proposal),value);if(s)return s;std::lock_guard<std::mutex> lock(p->mutex);return p->valid(&value,now);}
 MgcStatus mgm_planner_commit(MgmPlanner *p,const MgmProposal *proposal,int64_t now){if(!p)return MGC_INVALID_ARGUMENT;MgmProposal value{};auto s=copy_desc(proposal,sizeof(*proposal),value);if(s)return s;proposal=&value;std::lock_guard<std::mutex> lock(p->mutex);s=p->valid(proposal,now);if(s){if(p->pending&&p->pending->proposal_id==proposal->proposal_id)p->pending.reset();return s;}if(p->pending_tick==INT64_MAX)return MGC_INVALID_ARGUMENT;p->next_tick=p->pending_tick+1;p->pending.reset();return MGC_SUCCESS;}
-MgcStatus mgm_ticks_to_ns(int64_t ticks,MgmRational tb,int64_t *out){if(!out||tb.numerator<=0||tb.denominator<=0||ticks<0)return MGC_INVALID_ARGUMENT;int64_t seconds,remainder,multiplier,fraction;if(!mul(tb.numerator,ns_second,multiplier)||!mul(ticks/tb.denominator,multiplier,seconds)||!mul(ticks%tb.denominator,multiplier,remainder))return MGC_INVALID_ARGUMENT;fraction=remainder/tb.denominator;if(!add(seconds,fraction,*out))return MGC_INVALID_ARGUMENT;return MGC_SUCCESS;}
+MgcStatus mgm_ticks_to_ns(int64_t ticks,MgmRational tb,int64_t *out){
+    if(!out||tb.numerator<=0||tb.denominator<=0||ticks<0)return MGC_INVALID_ARGUMENT;
+    int64_t multiplier,whole,scaled_remainder,fraction,remainder_product,total;
+    const int64_t denominator=tb.denominator,remainder=ticks%denominator;
+    // Split both operands before multiplication: the final value can fit even
+    // when remainder * multiplier cannot be represented as an int64_t.
+    if(!mul(tb.numerator,ns_second,multiplier)||!mul(ticks/denominator,multiplier,whole)||
+       !mul(remainder,multiplier/denominator,scaled_remainder)||
+       !mul(remainder,multiplier%denominator,remainder_product)||
+       !add(scaled_remainder,remainder_product/denominator,fraction)||
+       !add(whole,fraction,total))return MGC_INVALID_ARGUMENT;
+    *out=total;return MGC_SUCCESS;
+}
 }
