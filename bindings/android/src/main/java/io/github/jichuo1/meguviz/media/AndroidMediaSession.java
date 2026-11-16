@@ -378,7 +378,8 @@ public final class AndroidMediaSession implements AutoCloseable {
         check((int)result[0]); long token=result[1];
         try{return new Frame(token,epoch);}catch(RuntimeException|Error failure){abandonUnpublishedFrame(token);throw failure;}
     }
-    /** Guard readbacks are bounded sparse grids, never full-frame pixels. */
+    /** Returns [status, isStatic, isCut, readbackBytes, isDuplicate].
+     * The byte count covers both inputs' sparse guard grids and counts shared grids once per input. */
     public long[] compare(Frame left, Frame right) { owner(); return MediaNative.androidCompare(handle, valid(left), valid(right)); }
     /** Runs on this dedicated worker; an accepted result is delivered only after
      * physical retirement and algorithm guards. Deadline admission and stale

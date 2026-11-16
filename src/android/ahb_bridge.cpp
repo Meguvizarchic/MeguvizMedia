@@ -220,6 +220,12 @@ namespace {
 int64_t now_ns(){timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return int64_t(t.tv_sec)*1000000000+t.tv_nsec;}
 bool extension(const char *all,const char *name){if(!all)return false;size_t n=std::strlen(name);for(auto p=std::strstr(all,name);p;p=std::strstr(p+n,name))if((p==all||p[-1]==' ')&&(p[n]==0||p[n]==' '))return true;return false;}
 std::atomic<uint64_t> next_allocation{uint64_t(1)<<48},next_content{1};
+struct GuardGridSampling {
+    uint32_t static_step,duplicate_x,duplicate_y;
+    GuardGridSampling(uint32_t width,uint32_t height)
+        :static_step(std::max(4u,width/320)),duplicate_x(std::max(1u,width/320)),duplicate_y(std::max(1u,height/180)){}
+    bool shares_duplicate_samples()const{return static_step==duplicate_x&&static_step==duplicate_y;}
+};
 struct Slot {
     std::atomic<uint32_t> pins{0};AHardwareBuffer *buffer=nullptr;EGLImageKHR image=EGL_NO_IMAGE_KHR;GLuint texture=0,fbo=0;
     uint64_t allocation=0,generation=0,content=0;std::vector<uint8_t> static_grid,scene_grid,duplicate_grid;
@@ -703,8 +709,16 @@ MgcStatus mgm_android_capture_oes(MgmAndroidSession *s,const MgmAndroidCapture *
     };
     glBindTexture(GL_TEXTURE_EXTERNAL_OES,c.oes_texture);glDrawArrays(GL_TRIANGLE_STRIP,0,4);status=state.checkpoint();
     if(status)return failed_after_draw(status);
-    const uint32_t step=std::max(4u,s->desc.width/320),sx=std::max(1u,s->desc.width/320),sy=std::max(1u,s->desc.height/180);
-    try{if(!status)status=s->sample_grid(*slot,(s->desc.width+step-1)/step,(s->desc.height+step-1)/step,0,slot->static_grid,state);if(!status)status=s->sample_grid(*slot,std::min(s->desc.width,64u),std::min(s->desc.height,36u),1,slot->scene_grid,state);if(!status)status=s->sample_grid(*slot,(s->desc.width+sx-1)/sx,(s->desc.height+sy-1)/sy,2,slot->duplicate_grid,state);}catch(...){status=MGC_OUT_OF_MEMORY;}
+    const GuardGridSampling grid(s->desc.width,s->desc.height);
+    const uint32_t step=grid.static_step,sx=grid.duplicate_x,sy=grid.duplicate_y;
+    try{
+        status=s->sample_grid(*slot,(s->desc.width+step-1)/step,(s->desc.height+step-1)/step,0,slot->static_grid,state);
+        if(!status)status=s->sample_grid(*slot,std::min(s->desc.width,64u),std::min(s->desc.height,36u),1,slot->scene_grid,state);
+        // Shader modes 0 and 2 use the same texel origins and clamping when
+        // both duplicate steps equal the static step.
+        if(!status&&!grid.shares_duplicate_samples())
+            status=s->sample_grid(*slot,(s->desc.width+sx-1)/sx,(s->desc.height+sy-1)/sy,2,slot->duplicate_grid,state);
+    }catch(...){status=MGC_OUT_OF_MEMORY;}
     if(status)return failed_after_draw(status);
     EGLSyncKHR fence=s->create_sync(s->display,s->native_fence?EGL_SYNC_NATIVE_FENCE_ANDROID:EGL_SYNC_FENCE_KHR,nullptr);
     if(fence==EGL_NO_SYNC_KHR)return transaction_failure(MGC_INTERNAL_ERROR);
@@ -735,8 +749,11 @@ MgcStatus mgm_android_compare_inputs(MgmAndroidSession *s,MgmFrame *a,MgmFrame *
     for(int i=0;i<2;++i){MgmFrameDesc d{};d.header=MGC_HEADER_INIT(MgmFrameDesc);status=mgm_frame_describe(frames[i],&d);if(status)return status;if(d.epoch!=s->desc.epoch)return MGC_CANCELLED;MgcLeaseInfo l{};l.header=MGC_HEADER_INIT(MgcLeaseInfo);status=mgc_lease_info(d.content,&l);if(status)return status;for(auto &slot:s->slots)if(slot->allocation==l.allocation_id&&slot->generation==l.allocation_generation&&slot->content==l.content_id)found[i]=slot.get();if(!found[i])return MGC_INVALID_ARGUMENT;}
     const auto &x=found[0]->static_grid,&y=found[1]->static_grid;uint64_t sum=0,count=0;bool bounded=true;for(size_t i=0;i<x.size();i+=4)for(int c=0;c<3;++c){int d=std::abs(int(x[i+c])-int(y[i+c]));sum+=d;++count;if(d>6)bounded=false;}result.is_static=bounded&&count&&sum*2<=count;
     const auto &p=found[0]->scene_grid,&q=found[1]->scene_grid;int bins[48]{};uint64_t difference=0,changed=0;for(size_t i=0;i<p.size();i+=4){int pixel=0;for(int c=0;c<3;++c){int av=p[i+c],bv=q[i+c];++bins[c*16+(av>>4)];--bins[c*16+(bv>>4)];pixel+=std::abs(av-bv);}difference+=pixel;if(pixel>=120)++changed;}uint64_t hist=0;for(int v:bins)hist+=std::abs(v);uint64_t samples=p.size()/4;result.is_cut=!result.is_static&&samples&&changed*10>=samples*7&&difference>=samples*135&&hist*100>=samples*6*45;
-    const auto &u=found[0]->duplicate_grid,&v=found[1]->duplicate_grid;uint64_t dup_sum=0,dup_count=0,noisy=0;bool dup_max=true;for(size_t i=0;i<u.size();i+=4)for(int c=0;c<3;++c){int d=std::abs(int(u[i+c])-int(v[i+c]));if(d>16)dup_max=false;if(d>4)++noisy;dup_sum+=d;++dup_count;}result.is_duplicate=dup_max&&dup_count&&dup_sum*10<=dup_count*3&&noisy*200<=dup_count;
-    result.sampled_readback_bytes=x.size()+y.size()+p.size()+q.size()+u.size()+v.size();mgm_detail::write_desc(out,result,size);return MGC_SUCCESS;
+    const bool shared=GuardGridSampling(s->desc.width,s->desc.height).shares_duplicate_samples();
+    const auto &u=shared?x:found[0]->duplicate_grid,&v=shared?y:found[1]->duplicate_grid;uint64_t dup_sum=0,dup_count=0,noisy=0;bool dup_max=true;for(size_t i=0;i<u.size();i+=4)for(int c=0;c<3;++c){int d=std::abs(int(u[i+c])-int(v[i+c]));if(d>16)dup_max=false;if(d>4)++noisy;dup_sum+=d;++dup_count;}result.is_duplicate=dup_max&&dup_count&&dup_sum*10<=dup_count*3&&noisy*200<=dup_count;
+    result.sampled_readback_bytes=x.size()+y.size()+p.size()+q.size();
+    if(!shared)result.sampled_readback_bytes+=u.size()+v.size();
+    mgm_detail::write_desc(out,result,size);return MGC_SUCCESS;
 }
 MgcStatus mgm_android_draw(MgmAndroidSession *s,MgmFrame *frame,uint32_t width,uint32_t height){
     if(!s||!s->current()||!frame||!width||!height)return MGC_INVALID_ARGUMENT;

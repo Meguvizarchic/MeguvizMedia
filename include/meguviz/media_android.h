@@ -48,6 +48,7 @@ typedef struct MgmAndroidCapture {
 typedef struct MgmAndroidGuardResult {
     MgcHeader header;
     uint32_t is_static,is_cut;
+    /* Total guard readback bytes for both inputs, counting shared grids once per input. */
     uint64_t sampled_readback_bytes;
     uint32_t is_duplicate,reserved;
 } MgmAndroidGuardResult;
