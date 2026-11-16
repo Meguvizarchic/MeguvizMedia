@@ -96,6 +96,8 @@ MGM_API MgcStatus mgm_timeline_may_present(MgmTimeline *timeline, MgmFrame *fram
 /* Identity transports a frame without copying pixels or claiming inference.
  * submit transfers one caller-provided reference for each non-null input on
  * ACCEPTED. Rejection transfers none. Callback owns one output reference.
+ * User callbacks must not throw across this C ABI. Context retain runs outside
+ * the effect lock; during that preparation, reentrant drain/release return BUSY.
  * release returns BUSY on its worker or while accepted work remains. */
 MGM_API MgcStatus mgm_identity_effect_create(MgcDomain *domain, MgmEffect **effect, MgmEffectApi *api);
 MGM_API MgcStatus mgm_identity_effect_release(MgmEffect *effect);

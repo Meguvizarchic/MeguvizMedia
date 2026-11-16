@@ -15,7 +15,7 @@ struct MgmTimeline { std::mutex mutex;MgmClockMapping mapping{}; };
 struct Job { MgmEffectRequest request{};MgmEffectCompletionFn callback=nullptr;void *context=nullptr;MgcContextFn release_context=nullptr;bool cancelled=false; };
 struct MgmEffect {
     MgcDomain *domain=nullptr;std::mutex mutex;std::condition_variable changed;
-    std::unique_ptr<Job> pending;Job *active=nullptr;bool stopping=false;
+    std::unique_ptr<Job> preparing,pending;std::thread::id preparing_thread;Job *active=nullptr;bool stopping=false;
     std::thread worker;
 };
 namespace {
@@ -54,21 +54,39 @@ MgcStatus submit(MgmEffect *e,const MgmEffectRequest *r,MgmEffectCompletionFn cb
     MgcCapability cap{};cap.header=MGC_HEADER_INIT(MgcCapability);if(mgc_domain_capability(e->domain,MGC_CAP_CPU_REFERENCE,&cap)||!cap.enabled)return MGC_UNSUPPORTED_CAPABILITY;
     try {
         auto job=std::make_unique<Job>();job->request=*r;job->callback=cb;job->context=ctx;job->release_context=release;
-        std::lock_guard<std::mutex> lock(e->mutex);if(e->stopping)return MGC_BUSY;if(e->pending||e->active)return MGC_BACKPRESSURE;
-        if(retain)retain(ctx);e->pending=std::move(job);e->changed.notify_one();return MGC_ACCEPTED;
+        // Reserve lifetime and capacity before calling user code; do not call
+        // context callbacks while holding the effect mutex.
+        {std::lock_guard<std::mutex> lock(e->mutex);if(e->stopping)return MGC_BUSY;if(e->preparing||e->pending||e->active)return MGC_BACKPRESSURE;
+         e->preparing=std::move(job);e->preparing_thread=std::this_thread::get_id();}
+        try {if(retain)retain(ctx);} catch(...) {
+            std::lock_guard<std::mutex> lock(e->mutex);e->preparing.reset();e->preparing_thread={};e->changed.notify_all();return MGC_INTERNAL_ERROR;
+        }
+        {std::lock_guard<std::mutex> lock(e->mutex);e->pending=std::move(e->preparing);e->preparing_thread={};e->changed.notify_all();}
+        return MGC_ACCEPTED;
     }catch(const std::bad_alloc&){return MGC_OUT_OF_MEMORY;}catch(...){return MGC_INTERNAL_ERROR;}
 }
 MgcStatus cancel(MgmEffect *e,uint64_t request_id) {
     if(!e)return MGC_INVALID_ARGUMENT;std::lock_guard<std::mutex> lock(e->mutex);
+    if(e->preparing&&e->preparing->request.request_id==request_id)e->preparing->cancelled=true;
     if(e->pending&&e->pending->request.request_id==request_id)e->pending->cancelled=true;
     if(e->active&&e->active->request.request_id==request_id)e->active->cancelled=true;
     return MGC_SUCCESS;
 }
 MgcStatus drain(MgmEffect *e,uint64_t timeout_ns) {
     if(!e)return MGC_INVALID_ARGUMENT;if(std::this_thread::get_id()==e->worker.get_id())return MGC_BUSY;
-    std::unique_lock<std::mutex> lock(e->mutex);auto done=[&]{return !e->pending&&!e->active;};if(done())return MGC_SUCCESS;
-    auto bounded=timeout_ns>uint64_t(INT64_MAX)?INT64_MAX:int64_t(timeout_ns);
-    return e->changed.wait_for(lock,std::chrono::nanoseconds(bounded),done)?MGC_SUCCESS:MGC_TIMEOUT;
+    std::unique_lock<std::mutex> lock(e->mutex);if(e->preparing&&e->preparing_thread==std::this_thread::get_id())return MGC_BUSY;auto done=[&]{return !e->preparing&&!e->pending&&!e->active;};if(done())return MGC_SUCCESS;
+    if(!timeout_ns)return MGC_TIMEOUT;
+    if(timeout_ns==UINT64_MAX){e->changed.wait(lock,done);return MGC_SUCCESS;}
+    // Avoid overflow in libc++'s predicate wait_for when a finite deadline is
+    // larger than the representable steady-clock time point.
+    constexpr uint64_t slice_ns=3600ULL*1000000000ULL;uint64_t remaining=timeout_ns;
+    for(;;){const auto start=std::chrono::steady_clock::now();
+        const auto slice=std::chrono::nanoseconds(static_cast<int64_t>(remaining<slice_ns?remaining:slice_ns));
+        if(e->changed.wait_for(lock,slice,done))return MGC_SUCCESS;
+        const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+        if(elapsed>0&&static_cast<uint64_t>(elapsed)>=remaining)return MGC_TIMEOUT;
+        if(elapsed>0)remaining-=static_cast<uint64_t>(elapsed);
+    }
 }
 }
 extern "C" {
@@ -88,5 +106,5 @@ MgcStatus mgm_timeline_reset(MgmTimeline *t,const MgmClockMapping *m){if(!t)retu
 MgcStatus mgm_timeline_may_present(MgmTimeline *t,MgmFrame *f){if(!t||!f)return MGC_INVALID_ARGUMENT;std::lock_guard<std::mutex> lock(t->mutex);return t->mapping.epoch==f->desc.epoch?MGC_SUCCESS:MGC_CANCELLED;}
 MgcStatus mgm_identity_effect_create(MgcDomain *domain,MgmEffect **out,MgmEffectApi *api){if(out)*out=nullptr;if(!domain||!out)return MGC_INVALID_ARGUMENT;MgmEffectApi value{};uint32_t size=0;auto s=copy_desc(api,offsetof(MgmEffectApi,reserved),value,&size);if(s)return s;if(value.required_flags)return MGC_UNSUPPORTED_ABI;if(!zero(value.reserved))return MGC_INVALID_ARGUMENT;
     try{auto e=std::make_unique<MgmEffect>();e->domain=domain;e->worker=std::thread(worker,e.get());mgc_domain_retain(domain);*out=e.release();value.query=query;value.prepare=prepare;value.submit=submit;value.cancel=cancel;value.drain=drain;value.estimated_cost_ns=0;write_desc(api,value,size);return MGC_SUCCESS;}catch(const std::bad_alloc&){return MGC_OUT_OF_MEMORY;}catch(...){return MGC_INTERNAL_ERROR;}}
-MgcStatus mgm_identity_effect_release(MgmEffect *e){if(!e)return MGC_INVALID_ARGUMENT;if(std::this_thread::get_id()==e->worker.get_id())return MGC_BUSY;{std::lock_guard<std::mutex> lock(e->mutex);if(e->pending||e->active)return MGC_BUSY;e->stopping=true;e->changed.notify_one();}e->worker.join();mgc_domain_release(e->domain);delete e;return MGC_SUCCESS;}
+MgcStatus mgm_identity_effect_release(MgmEffect *e){if(!e)return MGC_INVALID_ARGUMENT;if(std::this_thread::get_id()==e->worker.get_id())return MGC_BUSY;{std::lock_guard<std::mutex> lock(e->mutex);if(e->preparing||e->pending||e->active)return MGC_BUSY;e->stopping=true;e->changed.notify_one();}e->worker.join();mgc_domain_release(e->domain);delete e;return MGC_SUCCESS;}
 }
