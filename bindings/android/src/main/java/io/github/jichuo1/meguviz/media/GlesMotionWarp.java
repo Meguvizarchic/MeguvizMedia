@@ -19,6 +19,53 @@ public final class GlesMotionWarp implements WindowBackend {
     private static final int GRID_CELLS = GRID_W * GRID_H;
     private static final int INFERRED = 2;
 
+    /**
+     * Opt-in render fixed-cost switches. Zero is the frozen behaviour: {@link #WARP_FRAG} is
+     * compiled verbatim and no extra render target is created, so the default path stays
+     * byte-identical to the shipped shader.
+     * <p>This build generates the rank family, the census instrument, and the two estimator-prior
+     * switches the native layer now supports: {@code FC_VISIBILITY_GATE} (clear the
+     * {@code alternativeMotion()} subtree for cells the estimator's bidirectional visibility says
+     * cannot need it) and {@code FC_NATIVE_STATIC_GATE} (force zero motion on cells the fine stage
+     * classified static). {@code FC_STATIC_PRIOR} stays rejected: F measured it as a −3.51 dB
+     * regression in the subtitle ROI because its whole-cell static classification erases strokes.
+     */
+    static final int FC_CENSUS = 128;
+    static final int FC_RANK1_SHARE = 512;
+    static final int FC_RANK1_ALU = 1024;
+    /** Clears the alternative-motion subtree per cell from the estimator's visibility prior. */
+    static final int FC_VISIBILITY_GATE = 8;
+    /** Consumes the estimator's static classification: zero motion on static cells. */
+    static final int FC_NATIVE_STATIC_GATE = 16;
+    /** Bits this build can generate. */
+    static final int FC_SUPPORTED = FC_CENSUS | FC_RANK1_SHARE | FC_RANK1_ALU
+        | FC_VISIBILITY_GATE | FC_NATIVE_STATIC_GATE;
+    /** Every bit the render-fixed-cost lineage defines, so unknown bits stay distinguishable. */
+    private static final int FC_STATIC_MASK = 1, FC_SPARSE_CONFLICT = 2, FC_STATIC_PRIOR = 4,
+        FC_ATLAS_DEAD = 32, FC_PROPOSAL_CUT = 64, FC_NO_ALT_PROBE = 256;
+    private static final int FC_KNOWN = FC_STATIC_MASK | FC_SPARSE_CONFLICT | FC_STATIC_PRIOR
+        | FC_VISIBILITY_GATE | FC_NATIVE_STATIC_GATE | FC_ATLAS_DEAD | FC_PROPOSAL_CUT
+        | FC_CENSUS | FC_NO_ALT_PROBE | FC_RANK1_SHARE | FC_RANK1_ALU;
+    /** Switches measured as no-gain, harmful on Adreno, diagnostic-only, or explicitly rejected. */
+    private static final int FC_EXCLUDED = FC_STATIC_MASK | FC_SPARSE_CONFLICT | FC_STATIC_PRIOR
+        | FC_ATLAS_DEAD | FC_PROPOSAL_CUT | FC_NO_ALT_PROBE;
+    /**
+     * Visibility gate cut. A cell keeps the conflict-resolution subtree when either direction's
+     * visibility is below {@link #GATE_LOW} or the two directions disagree by more than
+     * {@link #GATE_ASYMMETRY}. A one-sided trajectory is exactly the case the atlas exists for,
+     * so asymmetry alone keeps the cell live even when both directions look individually clean.
+     */
+    static final float GATE_LOW = 0.25f, GATE_ASYMMETRY = 0.20f;
+    /** Support thresholds the atlas consumers use; the census reads the same cuts. */
+    static final float PAIR_CUT = 0.42f, SIDE_CUT = 0.58f;
+    /**
+     * Slack covering the RGBA16F round trip between the packed atlas and the shader. The atlas is
+     * uploaded as half floats, so a value the CPU reads as {@link #PAIR_CUT} can land marginally
+     * above it in the texture. Classifying only strictly below each consumer threshold keeps the
+     * CPU's dead set a subset of the shader's provably-dead set.
+     */
+    static final float SUPPORT_SAFE = 1.0f / 512.0f;
+
     private static final String QUAD = "#version 300 es\n"
         + "out vec2 uv;\n"
         + "void main() {\n"
@@ -292,6 +339,108 @@ public final class GlesMotionWarp implements WindowBackend {
         + "    color = vec4(fallback,1.0);\n"
         + "}\n";
 
+    // ---- Render fixed-cost variants ------------------------------------------------
+    // The frozen literal above is never edited in place. Each opt-in switch performs exactly one
+    // substitution on that literal and fails construction if the anchor is missing or repeated,
+    // so an "off" build provably compiles the untouched baseline source.
+    /**
+     * The two-rank candidate fill. Replacing it with the single-rank form keeps the array
+     * declarations and every downstream index intact, so only the amount of work changes.
+     */
+    private static final String ANCHOR_RANK_FILL =
+        "    for (int n=0; n<2; ++n) {\n"
+        + "        left[n] = proposal(cell,0,n);\n"
+        + "        right[n] = proposal(cell,1,n);\n"
+        + "    }\n";
+    private static final String RANK1_SHARED_FILL =
+        "    left[0] = proposal(cell,0,0);\n"
+        + "    right[0] = proposal(cell,1,0);\n"
+        + "    left[1] = left[0];\n"
+        + "    right[1] = right[0];\n";
+    /** Rank-0-only pair and side loops; same expressions, one iteration each. */
+    private static final String ANCHOR_PAIR_LOOPS =
+        "    for (int a=0; a<2; ++a) {\n"
+        + "        for (int b=0; b<2; ++b) {\n";
+    private static final String RANK0_PAIR_LOOP =
+        "    for (int a=0; a<1; ++a) {\n"
+        + "        for (int b=0; b<1; ++b) {\n";
+    private static final String ANCHOR_SIDE_LOOP =
+        "    for (int n=0; n<2; ++n) {\n"
+        + "        float vL = visibility(left[n],peakRight,originalLeft,sourceChange);\n";
+    private static final String RANK0_SIDE_LOOP =
+        "    for (int n=0; n<1; ++n) {\n"
+        + "        float vL = visibility(left[n],peakRight,originalLeft,sourceChange);\n";
+    private static final String ANCHOR_CANDIDATE_UNIFORM = "uniform highp sampler2D candidateField;\n";
+    private static final String ANCHOR_VIEW_CANDIDATE = "struct ViewCandidate {\n";
+    private static final String ANCHOR_ALTERNATIVE_COND =
+        "    if (conflict && disagreement > 24.0/255.0 &&\n"
+        + "        alternativeMotion(originalLeft,originalRight,disagreement,fallback,alternative)) {\n";
+    private static final String GATED_ALTERNATIVE_COND =
+        "    if (conflict && disagreement > 24.0/255.0 && cellConflict() &&\n"
+        + "        alternativeMotion(originalLeft,originalRight,disagreement,fallback,alternative)) {\n";
+    /**
+     * The cell-level conflict predicate: one RG8 fetch, uniform across each cell's interior. A
+     * set byte is a cell the estimator's visibility prior could not rule out, which is exactly
+     * the {@code alternativeMotion()} subtree's live set.
+     */
+    private static final String CELL_CONFLICT_HELPER =
+        "bool cellConflict() {\n"
+        + "    ivec2 cell = clamp(ivec2(floor(uv * GRID)), ivec2(0), ivec2(59, 33));\n"
+        + "    return texelFetch(cellPrior, cell, 0).g > 0.5;\n"
+        + "}\n"
+        + "\n";
+
+    private static String substitute(String source, String anchor, String replacement, String label) {
+        int first = source.indexOf(anchor);
+        if (first < 0) throw new IllegalStateException("missing shader anchor: " + label);
+        if (source.indexOf(anchor, first + 1) >= 0) throw new IllegalStateException("ambiguous shader anchor: " + label);
+        return source.substring(0, first) + replacement + source.substring(first + anchor.length());
+    }
+
+    /**
+     * The frozen fragment with the requested switches. With {@code options == 0} the result is
+     * {@link #WARP_FRAG} itself, which is what keeps the default path byte-exact.
+     */
+    static String warpFragment(int width, int height, int options) {
+        String fragment = WARP_FRAG;
+        boolean prior = false;
+        if ((options & FC_VISIBILITY_GATE) != 0) {
+            fragment = substitute(fragment, ANCHOR_ALTERNATIVE_COND, GATED_ALTERNATIVE_COND,
+                "alternative-motion gate");
+            fragment = substitute(fragment, ANCHOR_VIEW_CANDIDATE,
+                CELL_CONFLICT_HELPER + ANCHOR_VIEW_CANDIDATE, "cell conflict helper");
+            prior = true;
+        }
+        if ((options & FC_RANK1_SHARE) != 0) {
+            fragment = substitute(fragment, ANCHOR_RANK_FILL, RANK1_SHARED_FILL, "rank-1 colour share");
+        }
+        if ((options & FC_RANK1_ALU) != 0) {
+            fragment = substitute(fragment, ANCHOR_PAIR_LOOPS, RANK0_PAIR_LOOP, "pair loop collapse");
+            fragment = substitute(fragment, ANCHOR_SIDE_LOOP, RANK0_SIDE_LOOP, "side loop collapse");
+        }
+        if (prior) {
+            fragment = substitute(fragment, ANCHOR_CANDIDATE_UNIFORM,
+                ANCHOR_CANDIDATE_UNIFORM + "uniform highp sampler2D cellPrior;\n", "cell prior uniform");
+        }
+        return fragment;
+    }
+
+    /** Host/reference name for a shader literal so build receipts can identify exact bytes. */
+    static String literal(String name) {
+        switch (name) {
+            case "QUAD": return QUAD;
+            case "COPY": return COPY;
+            case "ORIGINAL": return ORIGINAL;
+            case "LUMA": return LUMA;
+            case "WARP_VERT": return WARP_VERT;
+            case "WARP_FRAG": return WARP_FRAG;
+            default: throw new IllegalArgumentException("unknown shader " + name);
+        }
+    }
+
+    /** The options this build can actually render, for callers that probe capability. */
+    static int supportedRenderOptions() { return FC_SUPPORTED; }
+
     private static ByteBuffer buffer(int size) {
         return ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder());
     }
@@ -382,7 +531,31 @@ public final class GlesMotionWarp implements WindowBackend {
         final ByteBuffer confidence = buffer(GRID_CELLS * 2);
         final ByteBuffer nativeCandidates = buffer(QcomCandidateField.RAW_BYTES);
         final ByteBuffer midpointCandidates = buffer(QcomCandidateField.ATLAS_BYTES);
+        /**
+         * Cell-level priors from the estimator, allocated only when a switch asked for them.
+         * <p>{@code visibility} drives the gate. {@code staticMask} is read for the occupancy
+         * receipt only: in ws-peak the static exemption of the gate rule exists only under
+         * {@code FC_STATIC_PRIOR}, which this build rejects, so an opt8 build's gate is exactly
+         * visibility-only and its R byte stays zero.
+         */
+        final ByteBuffer staticMask, visibility;
+        /** RG8 cell-prior texture payload: R static classification, G conflict subtree enabled. */
+        final ByteBuffer cellPrior;
+        int staticCells = -1, conflictCells = -1;
+        /** Ten-bucket histogram of min(forward, backward) visibility, in tenths. */
+        final int[] visibilityHistogram = new int[10];
+        /** Ten-bucket histogram of the cell's strongest atlas support, in tenths. */
+        final int[] atlasSupportHistogram = new int[10];
         boolean used;
+
+        FlowSlot(boolean staticMaskWanted, boolean gate) {
+            cellPrior = gate ? buffer(GRID_CELLS * 2) : null;
+            staticMask = staticMaskWanted ? buffer(GRID_CELLS) : null;
+            visibility = gate ? buffer(GRID_CELLS * 2 * Float.BYTES) : null;
+        }
+
+        /** True when the extended estimate entry point is needed to fill a prior plane. */
+        boolean wantsExtended() { return staticMask != null || visibility != null; }
     }
 
     private static final class Motion {
@@ -394,6 +567,8 @@ public final class GlesMotionWarp implements WindowBackend {
         long workNs;
         boolean ahbPending;
         long nativeEstimateNs = -1L, candidateProjectionNs = -1L;
+        /** Snapshot of this pair's atlas census, or null when no census was requested. */
+        int[] census;
         Throwable failure;
 
         Motion(Source left, Source right, FlowSlot flow, long id) {
@@ -405,13 +580,18 @@ public final class GlesMotionWarp implements WindowBackend {
     }
 
     private final SourceSlot[] sources = {new SourceSlot(0), new SourceSlot(1), new SourceSlot(2)};
-    private final FlowSlot[] flows = {new FlowSlot(), new FlowSlot(), new FlowSlot()};
+    private final FlowSlot[] flows;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Thread owner = Thread.currentThread();
     private Thread renderOwner;
     private boolean sharedDraw;
     private final int frameWidth, frameHeight;
-    private final boolean asyncReadback, useAhb;
+    private final boolean asyncReadback, useAhb, wantsVisibilityGate, wantsNativeStaticGate;
+    /** True when the RG8 cell-prior payload and texture are needed (the visibility gate). */
+    private final boolean wantsCellPrior;
+    private final int renderOptions;
+    /** Census reads the same projected atlas the shader fetches, so it runs only when asked. */
+    private final boolean wantsCensus;
     private boolean ahbGlUsed, ahbClosed;
     private long estimator, jobIds;
     private Future<Motion> pending;
@@ -419,6 +599,9 @@ public final class GlesMotionWarp implements WindowBackend {
     private boolean closingAhb;
     private int copyProgram, originalProgram, lumaProgram, warpProgram;
     private int framebuffer, lumaTexture, flowTexture, confidenceTexture, candidateTexture;
+    private int cellPriorTexture;
+    /** Retained only for the census and prior-occupancy receipts; holds no ownership. */
+    private Motion lastDrawn;
     private boolean closed;
 
     public GlesMotionWarp() {
@@ -434,20 +617,53 @@ public final class GlesMotionWarp implements WindowBackend {
     }
 
     public GlesMotionWarp(int width, int height, boolean asyncReadback, boolean useAhb) {
+        this(width, height, asyncReadback, useAhb, 0);
+    }
+
+    public GlesMotionWarp(int width, int height, boolean asyncReadback, boolean useAhb, int renderOptions) {
         this.useAhb = useAhb;
         this.asyncReadback = asyncReadback && !useAhb;
+        if (renderOptions < 0 || (renderOptions & ~FC_KNOWN) != 0) {
+            throw new IllegalArgumentException("unsupported render options " + renderOptions);
+        }
+        if ((renderOptions & FC_EXCLUDED) != 0) {
+            // Measured as zero-gain, structurally harmful on Adreno, diagnostic-only, or rejected
+            // on quality: 32/64 gave no device gain, 96 regressed to 30-36 ms, 1/2 changed the
+            // sparse path, 256 deletes the correction outright, and 4 lost 3.51 dB on subtitles.
+            throw new IllegalArgumentException(
+                "render options " + renderOptions + " are not shipped by this backend");
+        }
+        this.renderOptions = renderOptions;
+        wantsCensus = (renderOptions & FC_CENSUS) != 0;
+        wantsVisibilityGate = (renderOptions & FC_VISIBILITY_GATE) != 0;
+        wantsNativeStaticGate = (renderOptions & FC_NATIVE_STATIC_GATE) != 0;
+        wantsCellPrior = wantsVisibilityGate;
         if (width <= 0 || height <= 0 || width > 4096 || height > 4096 || (long) width * height > 4096L * 2160L) {
             throw new IllegalArgumentException("unsupported source size " + width + "x" + height);
         }
         frameWidth = width;
         frameHeight = height;
+        // A FlowSlot allocates the prior planes only when a switch asked for them, so the default
+        // path's working set is exactly the pre-existing one. The static plane is requested when
+        // the native static gate is on, because the occupancy receipt then reports its cell count.
+        flows = new FlowSlot[]{new FlowSlot(wantsNativeStaticGate, wantsVisibilityGate),
+            new FlowSlot(wantsNativeStaticGate, wantsVisibilityGate),
+            new FlowSlot(wantsNativeStaticGate, wantsVisibilityGate)};
         try {
             estimator = useAhb ? QcomMotionNative.createAhb() : QcomMotionNative.create();
             if (estimator == 0) throw new IllegalStateException("Vulkan QCOM block matcher unavailable");
+            if (wantsNativeStaticGate) {
+                // The classifier's own defaults, set explicitly so the gate cannot inherit a
+                // caller's earlier thresholds on this estimator handle.
+                QcomMotionNative.setStaticThresholds(estimator, 2, 10);
+                QcomMotionNative.setStaticGate(estimator, true);
+            }
             copyProgram = program(QUAD, COPY);
             originalProgram = program(QUAD, ORIGINAL);
             lumaProgram = program(QUAD, LUMA);
-            warpProgram = program(WARP_VERT, WARP_FRAG);
+            // Options zero compiles the frozen literal verbatim; a switch rewrites only the
+            // expression it needs, so "off" cannot drift away from the baseline source.
+            warpProgram = program(WARP_VERT, warpFragment(frameWidth, frameHeight, renderOptions));
             int[] name = new int[1];
             GLES30.glGenFramebuffers(1, name, 0);
             framebuffer = name[0];
@@ -466,6 +682,7 @@ public final class GlesMotionWarp implements WindowBackend {
             flowTexture = texture(GRID_W, GRID_H, GLES30.GL_RGBA16F, GLES30.GL_NEAREST);
             confidenceTexture = texture(GRID_W, GRID_H, GLES30.GL_RG8, GLES30.GL_NEAREST);
             candidateTexture = texture(GRID_W, QcomCandidateField.ROWS, GLES30.GL_RGBA16F, GLES30.GL_NEAREST);
+            if (wantsCellPrior) cellPriorTexture = texture(GRID_W, GRID_H, GLES30.GL_RG8, GLES30.GL_NEAREST);
             int lumaTarget = useAhb ? QcomMotionNative.lumaTexture(sources[0].ahbSlot) : lumaTexture;
             if (lumaTarget == 0) throw new IllegalStateException("invalid luma attachment");
             bindTarget(lumaTarget, LUMA_W / 4, LUMA_H);
@@ -603,13 +820,31 @@ public final class GlesMotionWarp implements WindowBackend {
                             // The two Source references held by Motion keep these exact generations
                             // and their original descriptors alive until positive Vulkan retirement.
                             motion.ahbPending = true;
-                            motion.status = QcomMotionNative.estimateAhbCandidates(estimator,
-                                first.slot.slotIndex, first.slot.producerFd, second.slot.slotIndex, second.slot.producerFd,
-                                flow.raw, flow.nativeCandidates);
+                            if (flow.wantsExtended()) {
+                                // Extended entry point: same estimate, plus the estimator's own
+                                // cell-level static classification and bidirectional visibility.
+                                // Confidence stays off because the shader consumes the packed byte
+                                // texture prepareMidpoint() builds, so the float plane would be
+                                // dead weight read back on the worker thread.
+                                motion.status = QcomMotionNative.estimateAhbExtended(estimator,
+                                    first.slot.slotIndex, first.slot.producerFd, second.slot.slotIndex, second.slot.producerFd,
+                                    flow.raw, null, flow.nativeCandidates,
+                                    flow.staticMask, flow.visibility);
+                            } else {
+                                motion.status = QcomMotionNative.estimateAhbCandidates(estimator,
+                                    first.slot.slotIndex, first.slot.producerFd, second.slot.slotIndex, second.slot.producerFd,
+                                    flow.raw, flow.nativeCandidates);
+                            }
                             motion.ahbPending = !QcomMotionNative.ahbRetired(estimator);
                         } else {
-                            motion.status = QcomMotionNative.estimateCandidates(estimator, first.slot.luma, second.slot.luma,
-                                flow.raw, null, flow.nativeCandidates);
+                            if (flow.wantsExtended()) {
+                                motion.status = QcomMotionNative.estimateExtended(estimator,
+                                    first.slot.luma, second.slot.luma, flow.raw, null, flow.nativeCandidates,
+                                    flow.staticMask, flow.visibility);
+                            } else {
+                                motion.status = QcomMotionNative.estimateCandidates(estimator,
+                                    first.slot.luma, second.slot.luma, flow.raw, null, flow.nativeCandidates);
+                            }
                         }
                         motion.nativeEstimateNs = System.nanoTime() - estimateStarted;
                         if (motion.status == 0) {
@@ -617,6 +852,12 @@ public final class GlesMotionWarp implements WindowBackend {
                             long projectionStarted = System.nanoTime();
                             motion.status = QcomMotionNative.prepareCandidates(flow.nativeCandidates, flow.midpointCandidates);
                             motion.candidateProjectionNs = System.nanoTime() - projectionStarted;
+                            // The census and the gate both read the projected atlas, so they run
+                            // after projection: the readings are then the exact values the shader
+                            // will fetch rather than the raw native candidates.
+                            if (motion.status == 0 && (flow.cellPrior != null || flow.staticMask != null))
+                                packCellPrior(flow);
+                            if (motion.status == 0 && wantsCensus) motion.census = atlasCensus(flow);
                         }
                     } catch (RuntimeException | Error failure) {
                         motion.failure = failure;
@@ -681,6 +922,7 @@ public final class GlesMotionWarp implements WindowBackend {
             quad();
         } else {
             Motion motion = (Motion) frame;
+            lastDrawn = motion;
             GLES30.glUseProgram(warpProgram);
             bindSampler(warpProgram, "previousImage", 0, GLES30.GL_TEXTURE_2D, motion.left.slot.texture);
             bindSampler(warpProgram, "currentImage", 1, GLES30.GL_TEXTURE_2D, motion.right.slot.texture);
@@ -696,6 +938,14 @@ public final class GlesMotionWarp implements WindowBackend {
             motion.flow.midpointCandidates.clear();
             GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, GRID_W, QcomCandidateField.ROWS,
                 GLES30.GL_RGBA, GLES30.GL_FLOAT, motion.flow.midpointCandidates);
+            if (cellPriorTexture != 0) {
+                // glTexSubImage2D writes to the texture bound on the active unit, so each upload
+                // binds its target first; the same binding serves the draw that follows.
+                bindSampler(warpProgram, "cellPrior", 5, GLES30.GL_TEXTURE_2D, cellPriorTexture);
+                motion.flow.cellPrior.clear();
+                GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H,
+                    GLES30.GL_RG, GLES30.GL_UNSIGNED_BYTE, motion.flow.cellPrior);
+            }
             GLES30.glDrawArraysInstanced(GLES30.GL_TRIANGLE_STRIP, 0, 4, (GRID_W + 1) * (GRID_H + 1));
         }
         checkGl("full-resolution output warp");
@@ -712,6 +962,9 @@ public final class GlesMotionWarp implements WindowBackend {
     }
 
     boolean usesAhb() { return useAhb; }
+
+    /** The exact render options this instance compiled, for run receipts. */
+    int renderOptions() { return renderOptions; }
 
     void closeWithFrames(Runnable releaseFrames, long deadlineNs) {
         if (closed) return;
@@ -756,7 +1009,7 @@ public final class GlesMotionWarp implements WindowBackend {
             ahbClosed = true;
         }
         int[] textures = {sources[0].texture, sources[1].texture, sources[2].texture,
-            lumaTexture, flowTexture, confidenceTexture, candidateTexture};
+            lumaTexture, flowTexture, confidenceTexture, candidateTexture, cellPriorTexture};
         GLES30.glDeleteTextures(textures.length, textures, 0);
         GLES30.glDeleteFramebuffers(1, new int[]{framebuffer}, 0);
         for (int handle : new int[]{copyProgram, originalProgram, lumaProgram, warpProgram}) {
@@ -831,6 +1084,127 @@ public final class GlesMotionWarp implements WindowBackend {
         releaseSource(motion.left);
         releaseSource(motion.right);
         motion.flow.used = false;
+    }
+
+    /**
+     * Per-pair census snapshot of the projected atlas: cells that keep the conflict subtree, cells
+     * the atlas cannot serve, surviving candidate colour fetches, then the strongest-support
+     * buckets. This answers, per frame, whether a slow stretch crosses more cells into the atlas
+     * path or makes each cell cost more. It never changes the shader or the drawn result.
+     */
+    private static int[] atlasCensus(FlowSlot slot) {
+        FloatBuffer atlas = slot.midpointCandidates.asFloatBuffer();
+        int[] histogram = new int[10];
+        int dead = 0, live = 0;
+        for (int cell = 0; cell < GRID_CELLS; cell++) {
+            float left = 0.0f, right = 0.0f;
+            for (int rank = 0; rank < QcomCandidateField.OUTPUT_COUNT; rank++) {
+                float l = atlas.get((rank * GRID_CELLS + cell) * 4 + 3);
+                float r = atlas.get(((QcomCandidateField.OUTPUT_COUNT + rank) * GRID_CELLS + cell) * 4 + 3);
+                left = Math.max(left, l);
+                right = Math.max(right, r);
+                // A fetch survives the 0.42 cut only when its own support can still be observed.
+                if (l > PAIR_CUT) live++;
+                if (r > PAIR_CUT) live++;
+            }
+            float best = Math.max(left, right);
+            // No pair can proceed (the loop needs min(left,right) > PAIR_CUT) and no single
+            // candidate can reach the visibility support term (> SIDE_CUT).
+            boolean unreachable = (left <= PAIR_CUT - SUPPORT_SAFE || right <= PAIR_CUT - SUPPORT_SAFE)
+                && best <= SIDE_CUT - SUPPORT_SAFE;
+            if (unreachable) dead++;
+            histogram[Math.min(9, Math.max(0, (int) (best * 10.0f)))]++;
+        }
+        int[] result = new int[6 + 10];
+        result[0] = GRID_CELLS - dead;
+        result[1] = dead;
+        result[4] = live;
+        result[5] = GRID_CELLS * 4;
+        System.arraycopy(histogram, 0, result, 6, 10);
+        return result;
+    }
+
+    /**
+     * Census of the most recently drawn pair, or null when {@link #FC_CENSUS} is off and before
+     * any warp draw. Layout: 0 conflict cells, 1 atlas-dead cells, 4 surviving candidate fetches,
+     * 5 the four-per-cell total, 6..15 the strongest-support histogram in tenths.
+     */
+    int[] lastCensus() {
+        Motion motion = lastDrawn;
+        return motion == null ? null : motion.census;
+    }
+
+    /**
+     * Packs the estimator's cell-level priors into the single RG8 texel the warp reads: R is the
+     * static classification, G is one when the cell must keep the conflict-resolution subtree.
+     * A cell keeps it when either direction's bidirectional visibility is low or the two directions
+     * disagree; see {@link #GATE_LOW} and {@link #GATE_ASYMMETRY}.
+     * <p>Only the gate has a shader consumer, so an opt16-only run does no atlas scan here: it
+     * counts the static cells for the occupancy receipt and stops.
+     */
+    private static void packCellPrior(FlowSlot slot) {
+        FloatBuffer visibility = slot.visibility == null ? null : slot.visibility.asFloatBuffer();
+        int staticCells = 0;
+        if (slot.cellPrior == null) {
+            if (slot.staticMask != null) {
+                for (int cell = 0; cell < GRID_CELLS; cell++) staticCells += slot.staticMask.get(cell) != 0 ? 1 : 0;
+            }
+            slot.staticCells = staticCells;
+            return;
+        }
+        slot.cellPrior.clear();
+        // Per-pair census: every bucket describes this pair only. Reusing a slot three times
+        // would otherwise accumulate the previous pairs into the same buckets.
+        java.util.Arrays.fill(slot.visibilityHistogram, 0);
+        java.util.Arrays.fill(slot.atlasSupportHistogram, 0);
+        FloatBuffer atlas = slot.midpointCandidates.asFloatBuffer();
+        int conflictCells = 0;
+        for (int cell = 0; cell < GRID_CELLS; cell++) {
+            int isStatic = slot.staticMask != null && slot.staticMask.get(cell) != 0 ? 1 : 0;
+            int conflict = 1;
+            if (visibility != null) {
+                float forward = visibility.get(cell), backward = visibility.get(cell + GRID_CELLS);
+                float weak = Math.min(forward, backward);
+                conflict = weak < GATE_LOW || Math.abs(forward - backward) > GATE_ASYMMETRY ? 1 : 0;
+            }
+            float left = 0.0f, right = 0.0f;
+            for (int rank = 0; rank < QcomCandidateField.OUTPUT_COUNT; rank++) {
+                left = Math.max(left, atlas.get((rank * GRID_CELLS + cell) * 4 + 3));
+                right = Math.max(right, atlas.get(((QcomCandidateField.OUTPUT_COUNT + rank) * GRID_CELLS + cell) * 4 + 3));
+            }
+            staticCells += isStatic;
+            conflictCells += conflict;
+            if (visibility != null) {
+                float weak = Math.min(visibility.get(cell), visibility.get(cell + GRID_CELLS));
+                slot.visibilityHistogram[Math.min(9, Math.max(0, (int) (weak * 10.0f)))]++;
+            }
+            slot.atlasSupportHistogram[Math.min(9, Math.max(0, (int) (Math.max(left, right) * 10.0f)))]++;
+            slot.cellPrior.put((byte) (isStatic * 255)).put((byte) (conflict * 255));
+        }
+        slot.staticCells = staticCells;
+        slot.conflictCells = conflictCells;
+        slot.cellPrior.clear();
+    }
+
+    /**
+     * Prior occupancy of the most recently drawn pair, for run receipts. Bit 8 (the gate) reports
+     * the conflict figures; bit 16 (the native static gate) reports the static figure. Every gate
+     * figure is -1 when the gate is off.
+     * <p>Layout: 0 static cells, 1 conflict cells, 2 total cells, 3..12 the minimum-visibility
+     * histogram in tenths, 13..22 the strongest-atlas-support histogram in tenths.
+     */
+    int[] lastPriorOccupancy() {
+        Motion motion = lastDrawn;
+        int[] result = new int[3 + 10 + 10];
+        boolean live = motion != null;
+        result[0] = !live || !wantsNativeStaticGate ? -1 : motion.flow.staticCells;
+        result[1] = !live || !wantsCellPrior ? -1 : motion.flow.conflictCells;
+        result[2] = GRID_CELLS;
+        if (live) {
+            System.arraycopy(motion.flow.visibilityHistogram, 0, result, 3, 10);
+            System.arraycopy(motion.flow.atlasSupportHistogram, 0, result, 13, 10);
+        }
+        return result;
     }
 
     private static void prepareMidpoint(FlowSlot slot) {

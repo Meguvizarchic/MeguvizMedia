@@ -1,0 +1,660 @@
+#version 450
+#extension GL_QCOM_image_processing : require
+
+// Candidate-field prototype
+// =========================
+// Three-level pyramid (120x72 -> 240x136 -> 480x272) replacing the frozen
+// two-level design, plus fine-level parabolic sub-pixel refinement, a compact
+// static mask and bidirectional consistency visibility.  Every matching
+// operation is still a hardware QCOM block match (SAD or SSD, 8x8 blocks).
+//
+// Stages, selected by push constant `stage`:
+//   0 coarse     120x72  8x8 blocks, 15x9 cells, stride-2 lattice :: +-48 out px
+//   1 mid        240x136 8x8 blocks, 30x17 cells, parent x2 + +-2 mid px window
+//   2 fine       480x272 8x8 blocks, 60x34 cells, parent x2 + +-2 px window,
+//                                                 candidates, sub-pixel, mask
+//   3 visibility flat dispatch over the 60x34 cells, no block matching
+//
+// Reach arithmetic.  One coarse pixel is four output pixels and one mid pixel is
+// two, so a lattice stride of two coarse pixels is an eight-output-pixel grid and
+// leaves at most half a stride (four output px) of residual - exactly the mid
+// window's reach (+-2 mid px == +-4 output px).  The mid residual is at most one
+// mid pixel (two output px) - exactly the fine window's reach (+-2 output px).
+// The three levels therefore tile the whole coarse lattice with no uncovered gap,
+// which is what fixes fast and large displacement.
+//
+// Two hypotheses travel down the pyramid: the coarse level publishes its winner
+// and the cheapest spatially separated alternative, and both are refined at the
+// mid and fine levels.  That is what lets the candidate list offer a genuinely
+// different trajectory across an occlusion boundary instead of three neighbours
+// of the same wrong match.
+//
+// Rank 0 of the candidate list is always the fine prediction-window winner, which
+// is the vector qcom_motion_estimate returns, so both entry points stay mutually
+// consistent exactly as in the frozen estimator.
+//
+// Geometry note: the coarse level is built at 120x72 (4x reduction, last coarse
+// row replicated by the host) so that 72 / 8 = 9 whole cell rows exist; 480x272
+// alone would leave 68 / 8 = 8.5 rows and an uncovered strip at the bottom.
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const bool squared = false;
+
+// Cost-reduction switches.  Both are specialization constants, not push
+// constants, on purpose: the default pipeline is created with them false and the
+// compiler then eliminates the adaptive code entirely, so enabling this feature
+// cannot shift register allocation or occupancy on the default path.  A push
+// constant branch was measured to cost ~0.3 ms of fine-stage time even when the
+// branch was never taken.  The host builds two pipelines from this one module.
+layout(constant_id = 1) const bool parallelReduce = false;
+layout(constant_id = 2) const bool gateAlternate = false;
+
+layout(set = 0, binding = 0) uniform sampler2D previousFrame;
+layout(set = 0, binding = 1) uniform sampler2D currentFrame;
+layout(set = 0, binding = 2, std430) buffer Coarse0 { vec4 coarse0[]; };
+layout(set = 0, binding = 3, std430) buffer Coarse1 { vec4 coarse1[]; };
+layout(set = 0, binding = 4, std430) buffer Fine { vec4 fine[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer Candidates { vec4 candidates[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer StaticMask { uint staticMask[]; };
+layout(set = 0, binding = 7, std430) writeonly buffer Visibility { float visibility[]; };
+
+layout(push_constant) uniform Parameters {
+    int width;
+    int height;
+    int stage;
+    int candidateMode;
+    int subpixel;
+    int staticThresholdMilli;
+    int staticNeighborMilli;
+    int reserved;
+    /* Parent-confidence cut in thousandths for gateAlternate: a cell refines the
+     * alternate hypothesis only when its parent's own confidence is below this.
+     * Ignored when the gateAlternate specialization constant is false. */
+    int confidenceGateMilli;
+} parameters;
+
+const int blockSize = 8;
+const float blockArea = float(blockSize * blockSize);
+
+const int radius = 2;
+const int side = 2 * radius + 1;
+const int windowCount = side * side;
+const int alternateRadius = 1;
+const int alternateSide = 2 * alternateRadius + 1;
+const int alternateCount = alternateSide * alternateSide;
+// Coarse lattice.  A stride of ONE coarse pixel makes the lattice a 4-output-pixel
+// grid, so the worst residual is 2 output px - well inside the mid window (+-4).
+// A stride of two (8 output px spacing) leaves a 4 px residual that only the
+// window edge can catch, and the outermost cells then lose the match entirely;
+// the shift sweep at 20/28/36/44 px is exactly that failure.  Dense sampling costs
+// more block matches at the coarsest, cheapest level and nothing at the fine one.
+const int farRadius = 16;
+const int farStride = 1;
+const int farSide = 2 * farRadius / farStride + 1;
+const int coarseSearchCount = farSide * farSide;
+
+const int groupCount = 8;
+const int candidateCount = 4;
+const int coarseWidth = 15;
+const int coarseHeight = 9;
+const int midWidth = 30;
+const int midHeight = 17;
+const int fineWidth = 60;
+const int fineHeight = 34;
+const int coarseCells = coarseWidth * coarseHeight;
+const int midCells = midWidth * midHeight;
+const int fineCells = fineWidth * fineHeight;
+
+const float invalidCost = 1.0e10;
+const vec4 invalid = vec4(0.0, 0.0, invalidCost, invalidCost);
+
+const int stageCoarse = 0;
+const int stageMid = 1;
+const int stageFine = 2;
+const int stageVisibility = 3;
+
+shared vec4 bestByLane[64];
+shared vec4 nextByLane[64];
+// Scratch pair for the parallel reduction.  The tree fold cannot run in place on
+// bestByLane/nextByLane: at the coarse and mid stages `pickSeparated` still reads
+// those arrays afterwards to choose the alternate hypothesis, so overwriting them
+// with partial fold results changes candidate ranks 1-3 (measured: 27-1252 float
+// values per configuration).  Folding into a dedicated pair leaves the source
+// arrays untouched and makes the reduction bit-exact for all five outputs.
+shared vec4 reduceBest[64];
+shared vec4 reduceNext[64];
+// Slot order keys for the parallel reduction.  The serial fold visits
+// bestByLane[0], nextByLane[0], bestByLane[1], ... and insertMatch keeps the
+// earlier entry on an exact (cost, weight) tie, so "earlier" is the total-order
+// tie-break the tree has to reproduce.
+shared uint bestOrderByLane[64];
+shared uint nextOrderByLane[64];
+shared vec4 extraByLane[64];
+shared vec4 sampledByLane[64];
+shared vec4 groupEntry[groupCount];
+shared vec4 selected[4];
+// The confidence denominator is the cost of the second-best sample inside the
+// prediction window.  It is captured before the candidate ranking overwrites
+// `selected[1]`, so the confidence reported by the candidate entry point stays
+// byte-identical to the plain estimate.
+shared float runnerUpCost;
+shared float axisCost[4];
+shared float probeCost[5];
+
+float matchCost(bool backwards, uvec2 origin, uvec2 other)
+{
+    if (squared) {
+        return backwards
+            ? textureBlockMatchSSDQCOM(previousFrame, other, currentFrame, origin, uvec2(blockSize)).r
+            : textureBlockMatchSSDQCOM(currentFrame, other, previousFrame, origin, uvec2(blockSize)).r;
+    }
+    return backwards
+        ? textureBlockMatchSADQCOM(previousFrame, other, currentFrame, origin, uvec2(blockSize)).r
+        : textureBlockMatchSADQCOM(currentFrame, other, previousFrame, origin, uvec2(blockSize)).r;
+}
+
+// Same-coordinate temporal difference.  Target and reference coordinates are
+// identical, so the result only reflects how much the scene changed between the
+// two frames at this place, independent of any motion hypothesis.
+float temporalCost(ivec2 at)
+{
+    return squared
+        ? textureBlockMatchSSDQCOM(currentFrame, uvec2(at), previousFrame, uvec2(at), uvec2(blockSize)).r
+        : textureBlockMatchSADQCOM(currentFrame, uvec2(at), previousFrame, uvec2(at), uvec2(blockSize)).r;
+}
+
+bool better(vec4 candidate, vec4 current)
+{
+    return candidate.z < current.z || (candidate.z == current.z && candidate.w < current.w);
+}
+
+vec4 betterOf(vec4 a, vec4 b)
+{
+    return better(b, a) ? b : a;
+}
+
+bool separated(vec4 candidate, vec4 anchor, float separation)
+{
+    if (candidate.z >= invalidCost)
+        return false;
+    if (anchor.z >= invalidCost)
+        return true;
+    return max(abs(candidate.x - anchor.x), abs(candidate.y - anchor.y)) >= separation;
+}
+
+bool insideBlock(ivec2 at, ivec2 dimensions)
+{
+    return all(greaterThanEqual(at, ivec2(0))) && all(lessThanEqual(at + blockSize, dimensions));
+}
+
+// A block-match call reads the target block with clamp-to-edge addressing but the
+// reference block must lie fully inside the image (VK_QCOM_image_processing: an
+// out-of-bounds reference region returns undefined values).  Because the shader
+// always uses the current cell as the reference and the searched cell as the
+// target, only the reference has to be in bounds; the target may overhang by up
+// to half a block, which is what extends usable reach to the outermost cells
+// instead of silently dropping every outward shift there.
+bool targetReachable(ivec2 at, ivec2 dimensions)
+{
+    const int slack = blockSize / 2;
+    return all(greaterThanEqual(at, ivec2(-slack))) &&
+           all(lessThanEqual(at + blockSize, dimensions + slack));
+}
+
+void insertMatch(vec4 candidate, inout vec4 best, inout vec4 runnerUp)
+{
+    if (better(candidate, best)) {
+        runnerUp = best;
+        best = candidate;
+    } else if (candidate.z < runnerUp.z) {
+        runnerUp = candidate;
+    }
+}
+
+// Eight groups scan a disjoint slice of the three per-lane arrays (192 slots)
+// and keep the cheapest entry separated from the winner.
+void pickSeparated(int lane, float separation)
+{
+    const int perGroup = (3 * 64 + groupCount - 1) / groupCount;
+    const int first = lane * perGroup;
+    vec4 entry = invalid;
+    for (int slot = first; slot < first + perGroup; ++slot) {
+        const int which = slot / 64;
+        vec4 option = invalid;
+        if (which == 0) option = bestByLane[slot & 63];
+        else if (which == 1) option = nextByLane[slot & 63];
+        else option = extraByLane[slot & 63];
+        if (separated(option, selected[0], separation) && better(option, entry))
+            entry = option;
+    }
+    groupEntry[lane] = entry;
+}
+
+vec4 reduceGroups()
+{
+    vec4 entry = invalid;
+    for (int group = 0; group < groupCount; ++group)
+        entry = betterOf(entry, groupEntry[group]);
+    return entry;
+}
+
+// REDUCTION_NOTE
+// ==============
+// The reference implementation folds the 128 (best, next) shared slots into
+// (winner, runnerUp) on lane 0 alone: 128 serial iterations while the other 63
+// lanes idle.  Measured on Adreno 740 that fold is 2.65 ms of the fine stage's
+// 5.74 ms and 0.68 ms of the mid stage's 1.34 ms - the largest purely
+// mechanical cost in the estimator.
+//
+// The parallel variant folds pairwise instead: lane L commits its own pair, then
+// a halving loop in shared memory combines the 64 partials.  It reaches the same
+// (best, runnerUp) whenever no two slots tie on (cost, weight); on an exact tie
+// the serial fold keeps the earlier slot and the tree keeps whichever the tree
+// happens to see first.  `better()` orders by cost then weight, and confidence
+// divides best by next, so a tie can only move `confidence` and the candidate
+// ranks - never the vector - which is what makes this switchable and verifiable
+// rather than a silent behaviour change.
+// Total order matching the serial fold: cost, then weight, then slot order.
+// Ordering by cost alone is what makes a tree reduction diverge from a left
+// fold - two samples can share a cost AND a weight while proposing different
+// shifts, and insertMatch then keeps whichever came first.  Carrying the slot
+// order makes the comparison a strict total order, so every association order
+// produces the same (winner, runnerUp) and the parallel path is exactly
+// equivalent rather than merely close.
+bool betterOrdered(vec4 candidate, uint candidateOrder, vec4 current, uint currentOrder)
+{
+    if (candidate.z < current.z) return true;
+    if (candidate.z > current.z) return false;
+    if (candidate.w < current.w) return true;
+    if (candidate.w > current.w) return false;
+    return candidateOrder < currentOrder;
+}
+
+void insertOrdered(vec4 candidate, uint candidateOrder, inout vec4 best, inout uint bestOrder,
+                   inout vec4 runnerUp, inout uint runnerUpOrder)
+{
+    if (betterOrdered(candidate, candidateOrder, best, bestOrder)) {
+        runnerUp = best;
+        runnerUpOrder = bestOrder;
+        best = candidate;
+        bestOrder = candidateOrder;
+    } else if (betterOrdered(candidate, candidateOrder, runnerUp, runnerUpOrder)) {
+        runnerUp = candidate;
+        runnerUpOrder = candidateOrder;
+    }
+}
+
+vec4 topTwoMerge(vec4 aBest, uint aBestOrder, vec4 aNext, uint aNextOrder,
+                 vec4 bBest, uint bBestOrder, vec4 bNext, uint bNextOrder,
+                 out vec4 outNext, out uint outNextOrder, out uint outBestOrder)
+{
+    vec4 best = invalid;
+    uint bestOrder = 0xffffffffu;
+    vec4 runner = invalid;
+    uint runnerOrder = 0xffffffffu;
+    insertOrdered(aBest, aBestOrder, best, bestOrder, runner, runnerOrder);
+    insertOrdered(aNext, aNextOrder, best, bestOrder, runner, runnerOrder);
+    insertOrdered(bBest, bBestOrder, best, bestOrder, runner, runnerOrder);
+    insertOrdered(bNext, bNextOrder, best, bestOrder, runner, runnerOrder);
+    outNext = runner;
+    outNextOrder = runnerOrder;
+    outBestOrder = bestOrder;
+    return best;
+}
+
+void visibilityMain(int lane)
+{
+    const int cell = int(gl_WorkGroupID.x) * 64 + lane;
+    if (cell >= fineCells)
+        return;
+    const int column = cell % fineWidth;
+    const int row = cell / fineWidth;
+    // Mean block error at which visibility reaches zero.  SAD and SSD use
+    // comparable scales: a uniform offset d gives SAD = d and SSD = d * d.
+    const float sadLimit = 0.12;
+    const float ssdLimit = sadLimit * sadLimit;
+    for (int direction = 0; direction < 2; ++direction) {
+        const int index = (direction * fineHeight + row) * fineWidth + column;
+        const vec4 winner = fine[index];
+        const ivec2 step = ivec2(round(winner.xy / float(blockSize)));
+        const ivec2 destination = clamp(ivec2(column, row) + step, ivec2(0),
+                                        ivec2(fineWidth - 1, fineHeight - 1));
+        const vec4 reverse = fine[(1 - direction) * fineCells + destination.y * fineWidth + destination.x];
+        // Forward/backward consistency: a correct trajectory sums to zero.
+        float cycle = 0.0;
+        if (winner.z < invalidCost && reverse.z < invalidCost) {
+            const float error = max(abs(winner.x + reverse.x), abs(winner.y + reverse.y));
+            cycle = clamp(1.0 - error / 3.0, 0.0, 1.0);
+        }
+        const float mean = winner.z / blockArea;
+        const float photo = squared
+            ? clamp(1.0 - mean / ssdLimit, 0.0, 1.0)
+            : clamp(1.0 - mean / sadLimit, 0.0, 1.0);
+        visibility[index] = cycle * photo;
+    }
+}
+
+void main()
+{
+    const int lane = int(gl_LocalInvocationID.x);
+    const int stage = parameters.stage;
+    if (stage == stageVisibility) {
+        visibilityMain(lane);
+        return;
+    }
+
+    const ivec2 grid = ivec2(gl_WorkGroupID.xy);
+    const int direction = int(gl_WorkGroupID.z);
+    const ivec2 dimensions = ivec2(parameters.width, parameters.height);
+    const ivec2 blocks = dimensions / blockSize;
+    const ivec2 origin = grid * blockSize;
+    const int cells = blocks.x * blocks.y;
+    const int index = direction * cells + grid.y * blocks.x + grid.x;
+    const bool exporting = stage == stageFine && parameters.candidateMode != 0;
+    const bool wide = parameters.candidateMode == 2;
+
+    // Parent prediction.  Each level publishes a winner plus a spatially
+    // separated alternate so the child can refine two independent trajectories.
+    ivec2 prediction = ivec2(0);
+    ivec2 alternate = ivec2(0);
+    bool haveAlternate = false;
+    // Parent decisiveness, 0..1, in the same form as the host's confidenceFor():
+    // 1 - best/next of the parent cell's own prediction window.  Only consulted
+    // when the gateAlternate specialization constant is true.
+    float parentConfidence = 0.0;
+    if (stage == stageMid) {
+        const ivec2 parent = min(grid / 2, ivec2(coarseWidth - 1, coarseHeight - 1));
+        const int parentIndex = parent.y * coarseWidth + parent.x;
+        const vec4 own = coarse0[direction * coarseCells + parentIndex];
+        prediction = ivec2(own.xy) * 2;
+        // coarse0's .w carries the parent's runner-up cost, so the parent's own
+        // confidence is derivable without another match.
+        if (own.z < invalidCost && own.w < invalidCost && own.w > 0.0)
+            parentConfidence = clamp(1.0 - own.z / own.w, 0.0, 1.0);
+        const vec4 other = coarse0[2 * coarseCells + direction * coarseCells + parentIndex];
+        haveAlternate = other.z < invalidCost;
+        alternate = ivec2(other.xy) * 2;
+    } else if (stage == stageFine) {
+        const ivec2 parent = min(grid / 2, ivec2(midWidth - 1, midHeight - 1));
+        const int parentIndex = parent.y * midWidth + parent.x;
+        const vec4 own = coarse1[direction * midCells + parentIndex];
+        prediction = ivec2(own.xy) * 2;
+        if (own.z < invalidCost && own.w < invalidCost && own.w > 0.0)
+            parentConfidence = clamp(1.0 - own.z / own.w, 0.0, 1.0);
+        const vec4 other = coarse1[2 * midCells + direction * midCells + parentIndex];
+        haveAlternate = other.z < invalidCost;
+        alternate = ivec2(other.xy) * 2;
+    }
+    prediction = clamp(prediction, -origin, dimensions - blockSize - origin);
+    alternate = clamp(alternate, -origin, dimensions - blockSize - origin);
+    const ivec2 gap = abs(alternate - prediction);
+    if (max(gap.x, gap.y) < 2)
+        haveAlternate = false;
+
+    // Sample layout at the mid and fine levels:
+    //   [0, windowCount)     primary prediction window (5x5); only these may
+    //                        define the legacy winner and candidate rank 0
+    //   [windowCount, ...)   alternate hypothesis window; candidate-only
+    // Term 1 keeps the frozen behaviour.  Term 2 (specialization constant, false
+    // by default) drops the alternate hypothesis where the parent level already
+    // reported a decisive winner, i.e. where a second trajectory is unlikely to
+    // matter.  It only ever removes candidate ranks 1-3 - the primary window, the
+    // reported vector, confidence, mask and visibility are untouched - so the
+    // quality risk is confined to the warp's conflict-resolution fallback.
+    bool alternateWanted = stage != stageCoarse && wide && haveAlternate;
+    if (gateAlternate && alternateWanted) {
+        alternateWanted = parentConfidence < float(parameters.confidenceGateMilli) * 1.0e-3;
+    }
+    const bool searchAlternate = alternateWanted;
+    const int alternateBase = windowCount;
+    const int alternateSpan = windowCount;
+    int searchCount = windowCount;
+    if (stage == stageCoarse)
+        searchCount = coarseSearchCount;
+    else if (searchAlternate)
+        searchCount = alternateBase + alternateSpan;
+
+    vec4 best = invalid;
+    vec4 next = invalid;
+    vec4 alternateBest = invalid;
+    for (int candidate = lane; candidate < searchCount; candidate += 64) {
+        ivec2 shift = ivec2(0);
+        int weight = 0;
+        bool isAlternate = false;
+        if (stage == stageCoarse) {
+            shift = ivec2(candidate % farSide, candidate / farSide) * farStride - farRadius;
+            weight = abs(shift.x) + abs(shift.y);
+        } else if (candidate < alternateBase) {
+            shift = prediction + ivec2(candidate % side, candidate / side) - radius;
+            weight = abs(candidate % side - radius) + abs(candidate / side - radius);
+        } else {
+            const int altIndex = candidate - alternateBase;
+            shift = alternate + ivec2(altIndex % side, altIndex / side) - radius;
+            weight = 100 + abs(altIndex % side - radius) + abs(altIndex / side - radius);
+            isAlternate = true;
+        }
+        // Every slot the candidate reduction later reads must be defined, so a
+        // rejected sample publishes `invalid` instead of leaving stale data.
+        vec4 entry = invalid;
+        if (targetReachable(origin + shift, dimensions)) {
+            const float score = matchCost(direction != 0, uvec2(origin), uvec2(origin + shift));
+            if (!isnan(score) && !isinf(score))
+                entry = vec4(vec2(shift), score, float(weight));
+        }
+        // The primary match must come from the prediction window, exactly as in
+        // the frozen estimator, so qcom_motion_estimate and rank 0 of the
+        // candidate list never disagree.
+        if (isAlternate)
+            alternateBest = betterOf(alternateBest, entry);
+        else
+            insertMatch(entry, best, next);
+        if (stage == stageFine && candidate < 64)
+            sampledByLane[candidate] = entry;
+    }
+
+    bestByLane[lane] = best;
+    nextByLane[lane] = next;
+    extraByLane[lane] = alternateBest;
+    // Serial fold order is bestByLane[0], nextByLane[0], bestByLane[1], ... so the
+    // order key of bestByLane[L] is 2L and of nextByLane[L] is 2L+1.
+    bestOrderByLane[lane] = 2u * uint(lane);
+    nextOrderByLane[lane] = 2u * uint(lane) + 1u;
+    barrier();
+
+    if (parallelReduce) {
+        // Lane L commits its own (best, next) pair, then the halving loop folds the
+        // 64 partials in shared memory.  The fold writes reduceBest/reduceNext, not
+        // bestByLane/nextByLane, because the coarse and mid stages read the latter
+        // afterwards in pickSeparated to pick the alternate hypothesis.  The order
+        // keys make the comparison a strict total order, so this reproduces the
+        // serial left fold exactly instead of only usually.
+        vec4 pairRunner = invalid;
+        uint pairRunnerOrder = 0xffffffffu, pairBestOrder = 0xffffffffu;
+        reduceBest[lane] = topTwoMerge(bestByLane[lane], bestOrderByLane[lane],
+                                       nextByLane[lane], nextOrderByLane[lane],
+                                       invalid, 0xffffffffu, invalid, 0xffffffffu,
+                                       pairRunner, pairRunnerOrder, pairBestOrder);
+        reduceNext[lane] = pairRunner;
+        bestOrderByLane[lane] = pairBestOrder;
+        nextOrderByLane[lane] = pairRunnerOrder;
+        barrier();
+        for (int span = 32; span > 0; span >>= 1) {
+            if (lane < span) {
+                vec4 mergedRunner = invalid;
+                uint mergedRunnerOrder = 0xffffffffu, mergedBestOrder = 0xffffffffu;
+                const vec4 merged = topTwoMerge(reduceBest[lane], bestOrderByLane[lane],
+                                                reduceNext[lane], nextOrderByLane[lane],
+                                                reduceBest[lane + span], bestOrderByLane[lane + span],
+                                                reduceNext[lane + span], nextOrderByLane[lane + span],
+                                                mergedRunner, mergedRunnerOrder, mergedBestOrder);
+                reduceBest[lane] = merged;
+                reduceNext[lane] = mergedRunner;
+                bestOrderByLane[lane] = mergedBestOrder;
+                nextOrderByLane[lane] = mergedRunnerOrder;
+            }
+            barrier();
+        }
+        if (lane == 0) {
+            selected[0] = reduceBest[0];
+            selected[1] = reduceNext[0];
+            runnerUpCost = reduceNext[0].z;
+        }
+    } else if (lane == 0) {
+        vec4 winner = invalid;
+        vec4 runnerUp = invalid;
+        for (int slot = 0; slot < 64; ++slot) {
+            insertMatch(bestByLane[slot], winner, runnerUp);
+            insertMatch(nextByLane[slot], winner, runnerUp);
+        }
+        selected[0] = winner;
+        selected[1] = runnerUp;
+        runnerUpCost = runnerUp.z;
+    }
+    barrier();
+
+    if (stage != stageFine) {
+        if (lane < groupCount)
+            pickSeparated(lane, 2.0);
+        barrier();
+        if (lane == 0) {
+            vec4 entry = reduceGroups();
+            // A refined alternate trajectory beats a merely separated neighbour
+            // whenever it is actually cheaper.
+            if (alternateBest.z < entry.z)
+                entry = alternateBest;
+            if (entry.z >= invalidCost && separated(selected[1], selected[0], 2.0))
+                entry = selected[1];
+            if (stage == stageCoarse) {
+                coarse0[index] = vec4(selected[0].xyz, selected[1].z);
+                coarse0[2 * coarseCells + index] = entry;
+            } else {
+                coarse1[index] = vec4(selected[0].xyz, selected[1].z);
+                coarse1[2 * midCells + index] = entry;
+            }
+        }
+        return;
+    }
+
+    if (exporting) {
+        for (int rank = 1; rank < candidateCount; ++rank) {
+            if (lane < groupCount) {
+                const int perGroup = (searchCount + groupCount - 1) / groupCount;
+                const int first = lane * perGroup;
+                const int last = min(first + perGroup, searchCount);
+                vec4 entry = invalid;
+                for (int slot = first; slot < last; ++slot) {
+                    const vec4 option = sampledByLane[slot];
+                    if (!better(option, entry))
+                        continue;
+                    bool distinct = true;
+                    for (int previous = 0; previous < rank; ++previous)
+                        distinct = distinct && separated(option, selected[previous], 2.0);
+                    if (distinct)
+                        entry = option;
+                }
+                groupEntry[lane] = entry;
+            }
+            barrier();
+            if (lane == 0)
+                selected[rank] = reduceGroups();
+            barrier();
+        }
+    }
+
+    // Four axis neighbours for the sub-pixel fit and, in the forward direction,
+    // five same-coordinate temporal probes for the static mask, all under one
+    // barrier.
+    const ivec2 winner = ivec2(selected[0].xy);
+    const ivec2 winnerOffset = winner - prediction;
+    const bool interior = all(greaterThanEqual(winnerOffset, ivec2(1 - radius)))
+        && all(lessThanEqual(winnerOffset, ivec2(radius - 1)));
+    if (lane < 4) {
+        ivec2 step = ivec2(0);
+        if (lane == 0) step = ivec2(-1, 0);
+        else if (lane == 1) step = ivec2(1, 0);
+        else if (lane == 2) step = ivec2(0, -1);
+        else step = ivec2(0, 1);
+        if (!insideBlock(origin + winner + step, dimensions)) {
+            axisCost[lane] = invalidCost;
+        } else if (interior) {
+            // Reuse the cost the prediction window already measured.
+            const ivec2 offset = winnerOffset + step + radius;
+            // Window sample k occupies slot k (the primary window starts at zero).
+            axisCost[lane] = sampledByLane[offset.y * side + offset.x].z;
+        } else {
+            axisCost[lane] = matchCost(direction != 0, uvec2(origin), uvec2(origin + winner + step));
+        }
+    } else if (direction == 0 && lane < 4 + 5) {
+        const int probe = lane - 4;
+        ivec2 offset = ivec2(0);
+        if (probe == 1) offset = ivec2(2, 0);
+        else if (probe == 2) offset = ivec2(-2, 0);
+        else if (probe == 3) offset = ivec2(0, 2);
+        else if (probe == 4) offset = ivec2(0, -2);
+        probeCost[probe] = temporalCost(clamp(origin + offset, ivec2(0), dimensions - blockSize));
+    }
+    barrier();
+    if (lane != 0)
+        return;
+
+    float subX = 0.0;
+    float subY = 0.0;
+    if (parameters.subpixel != 0 && selected[0].z < invalidCost) {
+        // Parabolic interpolation in each axis, guarded by the predicted vertex
+        // cost.  For the parabola through (-1, left), (0, centre), (1, right) the
+        // vertex value is centre - (right-left)^2 / (8 * second_difference).  A
+        // match cost is a sum of non-negative absolute or squared differences, so
+        // a vertex value below zero is physically impossible: it means the centre
+        // is already an exact zero residual (or the surface is not locally
+        // parabolic) and any sub-pixel move would make the match worse.  Testing
+        // non-negativity therefore rejects exactly those cases, including a
+        // perfectly matched block, instead of inventing a fractional offset.
+        const float center = selected[0].z;
+        const float left = axisCost[0];
+        const float right = axisCost[1];
+        const float up = axisCost[2];
+        const float down = axisCost[3];
+        if (left < invalidCost && right < invalidCost) {
+            const float denominator = left - 2.0 * center + right;
+            const float improvement = (right - left) * (right - left) / (8.0 * denominator);
+            if (denominator > 1.0e-6 && center - improvement >= 0.0)
+                subX = 0.5 * (left - right) / denominator;
+        }
+        if (up < invalidCost && down < invalidCost) {
+            const float denominator = up - 2.0 * center + down;
+            const float improvement = (down - up) * (down - up) / (8.0 * denominator);
+            if (denominator > 1.0e-6 && center - improvement >= 0.0)
+                subY = 0.5 * (up - down) / denominator;
+        }
+    }
+    if (isnan(subX) || !(abs(subX) <= 0.5)) subX = 0.0;
+    if (isnan(subY) || !(abs(subY) <= 0.5)) subY = 0.0;
+    const vec2 refined = selected[0].xy + vec2(subX, subY);
+    // Instance layout stays (dx, dy, best, next); `next` remains the integer
+    // runner-up cost so the host confidence formula is unchanged.
+    fine[index] = vec4(refined, selected[0].z, runnerUpCost);
+    if (exporting) {
+        const int destination = ((grid.y * blocks.x + grid.x) * 2 + direction) * candidateCount;
+        for (int rank = 0; rank < candidateCount; ++rank) {
+            const vec4 entry = rank == 0 ? vec4(refined, selected[0].z, selected[0].w) : selected[rank];
+            // Rank 0 keeps the winner's own tie-break weight; ranks 1-3 carry
+            // theirs from the search loop, and all of them are separated from
+            // every earlier rank by construction.
+            candidates[destination + rank] = entry.z < invalidCost
+                ? vec4(entry.xy, clamp(entry.z / blockArea, 0.0, 1.0), 1.0)
+                : vec4(0.0, 0.0, 1.0, 0.0);
+        }
+    }
+    if (direction == 0) {
+        // A cell is static when the block itself and all four neighbours two
+        // pixels away changed by less than the threshold between the two frames.
+        const float threshold = float(parameters.staticThresholdMilli) * 1.0e-3;
+        const float neighborThreshold = float(parameters.staticNeighborMilli) * 1.0e-3;
+        const float center = probeCost[0] / blockArea;
+        const float neighbors = max(max(probeCost[1], probeCost[2]),
+                                    max(probeCost[3], probeCost[4])) / blockArea;
+        const bool isStatic = squared
+            ? center <= threshold * threshold && neighbors <= neighborThreshold * neighborThreshold
+            : center <= threshold && neighbors <= neighborThreshold;
+        staticMask[grid.y * blocks.x + grid.x] = isStatic ? 1u : 0u;
+    }
+}

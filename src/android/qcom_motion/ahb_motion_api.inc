@@ -3,6 +3,7 @@ extern "C" QcomMotion *qcom_motion_create_ahb(int metric)
     if (metric != 0 && metric != 1) return nullptr;
     try {
         auto motion = std::make_unique<QcomMotion>();
+        applyStaticOverrides(*motion);
         motion->initialize(metric, true);
         return motion.release();
     } catch (const std::exception &error) {
@@ -33,11 +34,39 @@ extern "C" int qcom_motion_estimate_ahb(QcomMotion *motion, QcomAhbFrame left, Q
     if (motion->failed || motion->ahbSubmissionUnknown) return -2;
     try {
         const QcomAhbFrame inputs[]{left, right};
-        motion->estimate(nullptr, nullptr, vectors, confidence, candidates, timing, candidateMode, &inputs);
+        /* The frozen AHB entry point does not surface the prototype's static
+         * mask or visibility; qcom_motion_estimate_ahb_extended does. */
+        motion->estimate(nullptr, nullptr, vectors, confidence, candidates, nullptr, nullptr,
+                         timing, candidateMode, &inputs);
         return 0;
     } catch (const std::exception &error) {
         motion->failed = true;
         std::fprintf(stderr, "QCOM AHB estimate: %s\n", error.what());
+        return -3;
+    }
+}
+
+/* AHB counterpart of qcom_motion_estimate_extended.  Same semantics and the same
+ * optional outputs; staticMask and visibility are read back from the device
+ * buffers the AHB path already allocates, so no extra Vulkan resource is needed. */
+extern "C" int qcom_motion_estimate_ahb_extended(QcomMotion *motion, QcomAhbFrame left,
+                                                QcomAhbFrame right, float *vectors,
+                                                float *confidence, float *candidates,
+                                                uint8_t *staticMask, float *visibility,
+                                                QcomMotionTiming *timing, int candidateMode)
+{
+    if (!motion || !motion->ahb || !vectors ||
+        (candidateMode != QCOM_MOTION_CANDIDATE_LOCAL && candidateMode != QCOM_MOTION_CANDIDATE_WIDE))
+        return -1;
+    if (motion->failed || motion->ahbSubmissionUnknown) return -2;
+    try {
+        const QcomAhbFrame inputs[]{left, right};
+        motion->estimate(nullptr, nullptr, vectors, confidence, candidates, staticMask, visibility,
+                         timing, candidateMode, &inputs);
+        return 0;
+    } catch (const std::exception &error) {
+        motion->failed = true;
+        std::fprintf(stderr, "QCOM AHB extended estimate: %s\n", error.what());
         return -3;
     }
 }

@@ -14,8 +14,24 @@ final class QcomMotionNative {
     /** Float4 [cell][direction][rank]: dx, dy, normalized mean box SAD, valid. */
     static native int estimateCandidates(long handle, ByteBuffer previousR8, ByteBuffer currentR8,
                                         ByteBuffer vectors, ByteBuffer confidence, ByteBuffer candidates);
+    /** Same as estimateCandidates plus the static classification and visibility fields. */
+    static native int estimateExtended(long handle, ByteBuffer previousR8, ByteBuffer currentR8,
+                                      ByteBuffer vectors, ByteBuffer confidence, ByteBuffer candidates,
+                                      ByteBuffer staticMask, ByteBuffer visibility);
     static native int prepareCandidates(ByteBuffer candidates, ByteBuffer atlas);
     static native void destroy(long handle);
+
+    /** Opt-in parallel top-two reduction. mode is 0 (default) or 1 (reduction);
+     *  modes 2 and 3 are rejected because the alternate-window gate lost its
+     *  quality gate on device. Returns 0 on success, -1 on rejection. */
+    static native int setAdaptive(long handle, boolean enabled, int confidenceMilli);
+    /** Disables the fine sub-pixel refinement when enabled is false. */
+    static native void setSubpixel(long handle, boolean enabled);
+    /** Static-classification thresholds in thousandths of a normalized luma code value. */
+    static native int setStaticThresholds(long handle, int thresholdMilli, int neighborMilli);
+    /** Forces zero motion on cells the fine stage classified static. */
+    static native void setStaticGate(long handle, boolean enabled);
+
     static native long createAhb();
     static native long createLumaSlot(long estimator, int index);
     static native int lumaTexture(long slot);
@@ -27,4 +43,8 @@ final class QcomMotionNative {
     static native boolean ahbRetired(long estimator);
     static native int estimateAhbCandidates(long estimator, int leftSlot, int leftFd, int rightSlot, int rightFd,
                                             ByteBuffer vectors, ByteBuffer candidates);
+    /** AHB estimate that also surfaces the static mask and bidirectional visibility. */
+    static native int estimateAhbExtended(long estimator, int leftSlot, int leftFd, int rightSlot, int rightFd,
+                                          ByteBuffer vectors, ByteBuffer confidence, ByteBuffer candidates,
+                                          ByteBuffer staticMask, ByteBuffer visibility);
 }

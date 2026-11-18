@@ -130,6 +130,15 @@ float *direct(JNIEnv *env, jobject buffer, jlong bytes)
     return reinterpret_cast<uintptr_t>(out) % alignof(float) == 0 ? static_cast<float *>(out) : nullptr;
 }
 
+/* One byte per cell: the static classification has no alignment requirement, but
+ * returning null for a short buffer keeps the caller's error signal identical to
+ * the float outputs. */
+uint8_t *directBytes(JNIEnv *env, jobject buffer, jlong bytes)
+{
+    if (!buffer || env->GetDirectBufferCapacity(buffer) < bytes) return nullptr;
+    return static_cast<uint8_t *>(env->GetDirectBufferAddress(buffer));
+}
+
 QcomMotion *motion(jlong pointer) { return reinterpret_cast<QcomMotion *>(pointer); }
 }
 
@@ -225,5 +234,35 @@ extern "C" JNIEXPORT jint JNICALL QCOMJNI(estimateAhbCandidates)(JNIEnv *env, jc
         {static_cast<unsigned>(rightSlot), rightFd}, direct(env, vectors, cells * 4 * sizeof(float)), nullptr,
         direct(env, candidates, cells * 2 * QCOM_MOTION_CANDIDATE_COUNT * 4 * sizeof(float)),
         nullptr, QCOM_MOTION_CANDIDATE_WIDE);
+}
+
+/* AHB estimate that also surfaces the estimator's static classification and
+ * bidirectional visibility to the Java caller.  Both optional outputs are
+ * host-visible direct buffers the caller already owns, so no extra Vulkan
+ * allocation or synchronisation is involved.  Buffers, in order:
+ *   vectors     cells * 4 floats   forward dx,dy then backward dx,dy
+ *   confidence  cells * 2 floats   optional forward, backward confidence
+ *   candidates  cells * 2 * 4 * 4 floats   [cell][direction][rank][4], optional
+ *   staticMask  cells bytes        1 = classified static, optional
+ *   visibility  cells * 2 floats   [cell][direction] consistency * photometric
+ * A null optional buffer is skipped; a non-null buffer that is too small yields
+ * -1 before any submission. */
+extern "C" JNIEXPORT jint JNICALL QCOMJNI(estimateAhbExtended)(JNIEnv *env, jclass, jlong pointer,
+    jint leftSlot, jint leftFd, jint rightSlot, jint rightFd, jobject vectors, jobject confidence,
+    jobject candidates, jobject staticMask, jobject visibility)
+{
+    constexpr jlong candidateBytes = cells * 2 * QCOM_MOTION_CANDIDATE_COUNT * 4 * sizeof(float);
+    auto *vectorOutput = direct(env, vectors, cells * 4 * sizeof(float));
+    auto *confidenceOutput = confidence ? direct(env, confidence, cells * 2 * sizeof(float)) : nullptr;
+    auto *candidateOutput = candidates ? direct(env, candidates, candidateBytes) : nullptr;
+    auto *maskOutput = staticMask ? directBytes(env, staticMask, QCOM_MOTION_STATIC_BYTES) : nullptr;
+    auto *visibilityOutput = visibility
+        ? direct(env, visibility, QCOM_MOTION_VISIBILITY_FLOATS * sizeof(float)) : nullptr;
+    if (!vectorOutput || (confidence && !confidenceOutput) || (candidates && !candidateOutput) ||
+        (staticMask && !maskOutput) || (visibility && !visibilityOutput))
+        return -1;
+    return qcom_motion_estimate_ahb_extended(motion(pointer), {static_cast<unsigned>(leftSlot), leftFd},
+        {static_cast<unsigned>(rightSlot), rightFd}, vectorOutput, confidenceOutput, candidateOutput,
+        maskOutput, visibilityOutput, nullptr, QCOM_MOTION_CANDIDATE_WIDE);
 }
 

@@ -1,50 +1,97 @@
 #version 450
+
+// Three-level compact-luma unpacker.
+//
+// The AHB fixture writes a 120x272 RGBA8 texture in which one texel carries the
+// four horizontal luma bytes of four adjacent output pixels, so one texel word is
+// four output pixels.  Producing the whole pyramid from it needs no resampling:
+// the fine level is a verbatim copy, the mid level is a 2x2 box and the coarse
+// level a 4x4 box of the 480x272 luma.
+//
+// One dispatch writes all three levels.  Thread (x, y) covers packed texel (x, y):
+//   fine    480x272   x < 120, y < 272   word y*120 + x, 1 source texel
+//   mid     240x136   x <  60, y < 136   word y*60  + x, 2 source texels
+//   coarse  120x72    x <  30, y <  72   word y*30  + x, 4 source texels
+//
+// The box reductions replicate buildPyramid() in qcom_motion.cpp exactly, so
+// qcom_motion_ahb_test_pyramid() is a byte-equality check:
+//   scale 2: (sum + 2) / 4    output rows 2y, 2y+1   cols 2X, 2X+1
+//   scale 4: (sum + 8) / 16   output rows 4y..4y+3   cols 4X..4X+3
+// Source rows past 271 clamp to the last row, which is what gives the coarse
+// level the 72nd row it needs for 272/4 = 68 to become 9 whole cell rows.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D packedLuma;
 layout(set = 0, binding = 1, std430) buffer Output {
     uint words[];
 };
 layout(push_constant) uniform Args {
-    uint fineOffsetWords;
     uint coarseOffsetWords;
+    uint midOffsetWords;
+    uint fineOffsetWords;
     uint rgbaDestination;
 } args;
 
 const uint rows = 272u;
 const uint texels = 120u;
+const uint midWordsPerRow = 60u;
+const uint midRows = 136u;
+const uint coarseWordsPerRow = 30u;
+const uint coarseRows = 72u;
 
-uvec4 bytesAt(uvec2 coordinate)
+uvec4 bytesAt(uint x, uint y)
 {
-    return uvec4(floor(texelFetch(packedLuma, ivec2(coordinate), 0) * 255.0 + 0.5));
+    return uvec4(floor(texelFetch(packedLuma, ivec2(int(x), int(y)), 0) * 255.0 + 0.5));
 }
 
-void writeBytes(uint offset, uint index, uvec4 bytes)
+// One word holds four output pixels for an R8 target, or one RGBA8 texel (four
+// words) per output pixel when the device only supports the expanded format.
+void writeWord(uint offset, uint index, uvec4 bytes)
 {
     if (args.rgbaDestination == 0u) {
         words[offset + index] = bytes.r | (bytes.g << 8) | (bytes.b << 16) | (bytes.a << 24);
     } else {
-        uvec4 rgba = (bytes * 0x00010101u) | 0xff000000u;
+        const uvec4 rgba = (bytes * 0x00010101u) | 0xff000000u;
         for (uint channel = 0u; channel < 4u; ++channel)
             words[offset + index * 4u + channel] = rgba[channel];
     }
 }
 
-uvec2 narrow(uvec4 value)
-{
-    return value.rb + value.ga;
-}
-
 void main()
 {
-    uvec2 lane = gl_GlobalInvocationID.xy;
+    const uvec2 lane = gl_GlobalInvocationID.xy;
     if (lane.x >= texels || lane.y >= rows)
         return;
-    writeBytes(args.fineOffsetWords, lane.y * texels + lane.x, bytesAt(lane));
-    if (lane.x >= texels / 2u || lane.y >= rows / 2u)
-        return;
-    uvec2 pixel = lane * 2u;
-    uvec4 sum = uvec4(narrow(bytesAt(pixel) + bytesAt(pixel + uvec2(0u, 1u))),
-                      narrow(bytesAt(pixel + uvec2(1u, 0u)) + bytesAt(pixel + uvec2(1u, 1u))));
-    writeBytes(args.coarseOffsetWords, lane.y * (texels / 2u) + lane.x, (sum + 2u) / 4u);
-}
 
+    // Fine: the packed texel already holds the four output bytes of this word.
+    writeWord(args.fineOffsetWords, lane.y * texels + lane.x, bytesAt(lane.x, lane.y));
+
+    // Mid: mid pixels 4X..4X+3 come from packed texels 2X and 2X+1, averaging the
+    // two output rows 2Y and 2Y+1.  Inside one texel the r/g pair is one mid pixel
+    // and the b/a pair the next.
+    if (lane.x < midWordsPerRow && lane.y < midRows) {
+        const uint tx = lane.x * 2u, ty = lane.y * 2u;
+        const uvec4 t0 = bytesAt(tx, ty), t1 = bytesAt(tx, ty + 1u);
+        const uvec4 u0 = bytesAt(tx + 1u, ty), u1 = bytesAt(tx + 1u, ty + 1u);
+        const uvec4 sum = uvec4(t0.r + t0.g + t1.r + t1.g,
+                                t0.b + t0.a + t1.b + t1.a,
+                                u0.r + u0.g + u1.r + u1.g,
+                                u0.b + u0.a + u1.b + u1.a);
+        writeWord(args.midOffsetWords, lane.y * midWordsPerRow + lane.x, (sum + 2u) / 4u);
+    }
+
+    // Coarse: coarse pixels 4X..4X+3 come from packed texels 4X..4X+3, each a full
+    // 4x4 output block.  All four channels of the texel contribute, so the four
+    // source rows are summed first and then collapsed.
+    if (lane.x < coarseWordsPerRow && lane.y < coarseRows) {
+        const uint firstRow = lane.y * 4u;
+        uint coarse[4];
+        for (uint k = 0u; k < 4u; ++k) {
+            uvec4 sum = uvec4(0u);
+            for (uint dy = 0u; dy < 4u; ++dy)
+                sum += bytesAt(lane.x * 4u + k, min(firstRow + dy, rows - 1u));
+            coarse[k] = (sum.r + sum.g + sum.b + sum.a + 8u) / 16u;
+        }
+        writeWord(args.coarseOffsetWords, lane.y * coarseWordsPerRow + lane.x,
+                  uvec4(coarse[0], coarse[1], coarse[2], coarse[3]));
+    }
+}

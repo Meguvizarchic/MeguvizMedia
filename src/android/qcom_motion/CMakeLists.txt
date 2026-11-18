@@ -38,10 +38,10 @@ set(MGM_QCOM_MOTION_CORE
   "${MGM_QCOM_MOTION_DIR}/qcom_candidate_projection.cpp")
 
 add_library(meguviz_qcom_motion_core STATIC ${MGM_QCOM_MOTION_CORE})
-# Deliberately default visibility: the frozen prototype compiled without
-# -fvisibility=hidden and exported both the JNI class and the qcom_motion_* C
-# ABI. Export control comes from the linker version script below, which can only
-# restrict -- it cannot promote a symbol the compiler marked hidden.
+# Deliberately default visibility: the estimator exports both the JNI class
+# and the qcom_motion_* C ABI. Export control comes from the linker version
+# script below, which can only restrict -- it cannot promote a symbol the
+# compiler marked hidden.
 set_target_properties(meguviz_qcom_motion_core PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 target_compile_features(meguviz_qcom_motion_core PUBLIC cxx_std_17)
@@ -53,16 +53,17 @@ target_include_directories(meguviz_qcom_motion_core PUBLIC
 # NDK ships libvulkan.so as a platform stub; no find_package(Vulkan) needed.
 target_link_libraries(meguviz_qcom_motion_core PUBLIC vulkan)
 
-# SPIR-V: the checked-in headers are byte-identical to what glslang produced for
-# the frozen prototype (unpack.spv a0c8c035..., motion.spv as pinned in
-# coordinate/verification evidence). Recompiling requires glslangValidator on
-# PATH and is only a cross-check, never the shipped artifact.
+# SPIR-V: the checked-in headers are the shipped artifact.  motion_spv.h is built
+# from motion.comp by the same glslang the cf-peak verification used (SPIR-V 1.4,
+# Vulkan 1.1 target); the header reproduces that compilation exactly, so a
+# rebuild is a cross-check rather than the source of truth.  Recompiling requires
+# glslangValidator on PATH.
 if(NOT MGM_QCOM_MOTION_PREBUILT_SPV)
   find_program(MGM_GLSLANG_VALIDATOR NAMES glslangValidator glslang)
   if(NOT MGM_GLSLANG_VALIDATOR)
     message(FATAL_ERROR "MGM_QCOM_MOTION_PREBUILT_SPV=OFF needs glslangValidator on PATH")
   endif()
-  foreach(shader IN ITEMS unpack)
+  foreach(shader IN ITEMS motion unpack)
     set(spv "${CMAKE_CURRENT_BINARY_DIR}/${shader}.spv")
     add_custom_command(OUTPUT "${spv}"
       COMMAND "${MGM_GLSLANG_VALIDATOR}" -V --target-env vulkan1.1
@@ -74,8 +75,8 @@ if(NOT MGM_QCOM_MOTION_PREBUILT_SPV)
   endforeach()
 endif()
 
-# Single JNI object mirroring the verified prototype: estimator + Android
-# projection + JNI entry points + AHB bridge in one .so.
+# Single JNI object: estimator + Android projection + JNI entry points +
+# AHB bridge in one .so.
 add_library(meguviz_qcom_motion SHARED
   "${MGM_QCOM_MOTION_DIR}/qcom_motion_jni.cpp"
   "${MGM_QCOM_MOTION_DIR}/ahb_jni.cpp")
@@ -87,7 +88,7 @@ target_compile_options(meguviz_qcom_motion PRIVATE -fexceptions -Wall -Wextra
   -Wno-missing-field-initializers -fno-fast-math -ffp-contract=off)
 target_include_directories(meguviz_qcom_motion PRIVATE "${MGM_QCOM_MOTION_DIR}")
 # Link order is load-bearing: DT_NEEDED follows the command line, and the
-# verified prototype emitted libEGL, libGLESv3, libvulkan, libandroid.
+# reference build emitted libEGL, libGLESv3, libvulkan, libandroid.
 target_link_libraries(meguviz_qcom_motion PRIVATE
   meguviz_qcom_motion_core EGL GLESv3 vulkan android ${CMAKE_DL_LIBS})
 # 16 KiB page alignment is mandatory for API 35+ devices.

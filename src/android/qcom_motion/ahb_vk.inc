@@ -11,6 +11,11 @@ constexpr VkImageUsageFlags lumaAhbUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE
 constexpr auto externalImageType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 constexpr auto externalSyncType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
 constexpr VkImageSubresourceRange colorSubresources{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+/* Timestamp slots owned by AhbInput::record(); the estimator writes slots 0 and
+ * 4-9 itself, so these three sit strictly between them. */
+constexpr uint32_t stampAcquired = 1;
+constexpr uint32_t stampUnpacked = 2;
+constexpr uint32_t stampReleased = 3;
 
 bool supportsAhb(VkInstance instance, VkPhysicalDevice physical,
                  const std::vector<VkExtensionProperties> &extensions)
@@ -122,7 +127,7 @@ struct AhbInput {
         allocate.descriptorSetCount = 2;
         allocate.pSetLayouts = layouts;
         checked(vkAllocateDescriptorSets(device, &allocate, sets.data()), "allocate AHB prep sets");
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(uint32_t)};
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 4 * sizeof(uint32_t)};
         VkPipelineLayoutCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineInfo.setLayoutCount = 1;
         pipelineInfo.pSetLayouts = &layout;
@@ -224,9 +229,13 @@ struct AhbInput {
         }
     }
 
-    void record(VkCommandBuffer command, const QcomAhbFrame (&inputs)[2], const std::array<Image, 4> &images,
-                const Buffer &staging, bool rgba)
+    void record(VkCommandBuffer command, const QcomAhbFrame (&inputs)[2], const std::array<Image, 6> &images,
+                const Buffer &staging, bool rgba, VkQueryPool timestamps)
     {
+        auto stamp = [&](uint32_t slot) {
+            if (timestamps)
+                vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, timestamps, slot);
+        };
         VkImageMemoryBarrier access[2]{};
         for (unsigned i = 0; i < 2; ++i) {
             const Image &image = imported[inputs[i].slot];
@@ -254,10 +263,17 @@ struct AhbInput {
         }
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 0, nullptr, 0, nullptr, 2, access);
+        // Foreign-queue acquire for both imported AHB views retired.
+        stamp(stampAcquired);
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         for (unsigned i = 0; i < 2; ++i) {
-            const uint32_t args[]{static_cast<uint32_t>(images[2+i].offset / sizeof(uint32_t)),
-                                  static_cast<uint32_t>(images[i].offset / sizeof(uint32_t)), rgba ? 1u : 0u};
+            // One dispatch fills all three levels: images[0..1] are the coarse pair,
+            // [2..3] the mid pair, [4..5] the fine pair, and the unpack shader always
+            // reads the fine (unpacked) input.
+            const uint32_t args[]{static_cast<uint32_t>(images[0+i].offset / sizeof(uint32_t)),
+                                  static_cast<uint32_t>(images[2+i].offset / sizeof(uint32_t)),
+                                  static_cast<uint32_t>(images[4+i].offset / sizeof(uint32_t)),
+                                  rgba ? 1u : 0u};
             vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &sets[i], 0, nullptr);
             vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), args);
             vkCmdDispatch(command, qcom::ahb::packedWidth / 8, height / 8, 1);
@@ -265,6 +281,8 @@ struct AhbInput {
             access[i].dstAccessMask = 0;
             std::swap(access[i].srcQueueFamilyIndex, access[i].dstQueueFamilyIndex);
         }
+        // Both unpack dispatches retired.
+        stamp(stampUnpacked);
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             0, 0, nullptr, 0, nullptr, 2, access);
         VkBufferMemoryBarrier output{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -275,6 +293,8 @@ struct AhbInput {
         output.size = staging.size;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 1, &output, 0, nullptr);
+        // Foreign-queue release and staging handover to TRANSFER retired.
+        stamp(stampReleased);
     }
 };
 }

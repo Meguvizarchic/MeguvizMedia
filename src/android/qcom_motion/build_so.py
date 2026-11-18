@@ -1,20 +1,19 @@
 """Link the AHB-capable QCOM motion JNI shared object.
 
-The frozen prototype only compiled qcom_motion.cpp to an object file and built a
-standalone probe (edge-v6/ahb-input/build.py); no script in edge-v6 linked the
-JNI .so that the window APK actually shipped. This script records the recipe that
-was reverse-engineered from the frozen binary and proves it byte-exact.
+Records the linker recipe for the shipped JNI library and pins its bytes so an
+accidental toolchain or source drift is caught at build time.
 
 Usage:
     python build_so.py --ndk-bin <ndk toolchain bin> --out <output directory>
 
-Verified: reproduces
+Verified with NDK 30.0.16248370, clang --target=aarch64-linux-android27:
     libmeguviz_qcom_motion.so
-    sha256 9e96975e02d1c4c0a396d6c20fe534bed1795ed988875112964cbe3b41e5ba83
-    bytes  1198952
-from ahb-input sources against edge-v6/compute/qcom_motion.h and the two JNI /
-projection translation units. Library order matters: DT_NEEDED is emitted in
-command-line order, so -lEGL -lGLESv3 -lvulkan -landroid is required.
+    sha256 3ad176fc12fe4fa0934bf6dd94b804b57704c2e75045fd3fe5faa70ca06a581b
+    bytes  1232624
+from the four translation units beside this script (three-level estimator with
+the parallel-reduction pipeline, AHB bridge, JNI bridge, candidate projection).
+Library order matters: DT_NEEDED is emitted in command-line order, so
+-lEGL -lGLESv3 -lvulkan -landroid is required.
 """
 
 import argparse
@@ -24,8 +23,8 @@ from pathlib import Path
 import subprocess
 
 HERE = Path(__file__).resolve().parent
-EXPECTED_SHA256 = "9e96975e02d1c4c0a396d6c20fe534bed1795ed988875112964cbe3b41e5ba83"
-EXPECTED_BYTES = 1198952
+EXPECTED_SHA256 = "3ad176fc12fe4fa0934bf6dd94b804b57704c2e75045fd3fe5faa70ca06a581b"
+EXPECTED_BYTES = 1232624
 
 # All inputs live beside this script, so the file works both in this package and
 # after patch 01 places it at src/android/qcom_motion/build_so.py.
@@ -99,7 +98,7 @@ def main():
     print(f"bytes  {len(blob)}")
     assert len(blob) == EXPECTED_BYTES, f"size drift: {len(blob)}"
     assert digest == EXPECTED_SHA256, f"hash drift: {digest}"
-    print("byte-exact reproduction of the frozen prototype JNI object")
+    print("byte-exact reproduction of the pinned JNI object")
 
 
 if __name__ == "__main__":
