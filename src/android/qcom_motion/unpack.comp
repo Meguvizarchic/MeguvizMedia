@@ -1,0 +1,50 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D packedLuma;
+layout(set = 0, binding = 1, std430) buffer Output {
+    uint words[];
+};
+layout(push_constant) uniform Args {
+    uint fineOffsetWords;
+    uint coarseOffsetWords;
+    uint rgbaDestination;
+} args;
+
+const uint rows = 272u;
+const uint texels = 120u;
+
+uvec4 bytesAt(uvec2 coordinate)
+{
+    return uvec4(floor(texelFetch(packedLuma, ivec2(coordinate), 0) * 255.0 + 0.5));
+}
+
+void writeBytes(uint offset, uint index, uvec4 bytes)
+{
+    if (args.rgbaDestination == 0u) {
+        words[offset + index] = bytes.r | (bytes.g << 8) | (bytes.b << 16) | (bytes.a << 24);
+    } else {
+        uvec4 rgba = (bytes * 0x00010101u) | 0xff000000u;
+        for (uint channel = 0u; channel < 4u; ++channel)
+            words[offset + index * 4u + channel] = rgba[channel];
+    }
+}
+
+uvec2 narrow(uvec4 value)
+{
+    return value.rb + value.ga;
+}
+
+void main()
+{
+    uvec2 lane = gl_GlobalInvocationID.xy;
+    if (lane.x >= texels || lane.y >= rows)
+        return;
+    writeBytes(args.fineOffsetWords, lane.y * texels + lane.x, bytesAt(lane));
+    if (lane.x >= texels / 2u || lane.y >= rows / 2u)
+        return;
+    uvec2 pixel = lane * 2u;
+    uvec4 sum = uvec4(narrow(bytesAt(pixel) + bytesAt(pixel + uvec2(0u, 1u))),
+                      narrow(bytesAt(pixel + uvec2(1u, 0u)) + bytesAt(pixel + uvec2(1u, 1u))));
+    writeBytes(args.coarseOffsetWords, lane.y * (texels / 2u) + lane.x, (sum + 2u) / 4u);
+}
+
