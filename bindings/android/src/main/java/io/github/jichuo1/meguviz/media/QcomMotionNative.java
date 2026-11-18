@@ -41,6 +41,13 @@ final class QcomMotionNative {
     static native void closeLumaFence(int fd);
     static native boolean drainLumaEgl(long slot);
     static native boolean ahbRetired(long estimator);
+    /** Composite-driver wait policy for the submit->retire fence.  Only how the CPU
+     * observes the existing fence changes; estimator outputs are unaffected.
+     * strategy: 0 = blocking (default), 1 = bounded spin then block.  spinNs 0
+     * selects the adaptive budget (previous frame's retire interval + margin). */
+    static native int setWaitStrategy(long estimator, int strategy);
+    /** Fixed spin budget in ns, clamped to one 60 Hz frame; 0 = adaptive budget. */
+    static native int setWaitSpinNs(long estimator, long spinNs);
     static native int estimateAhbCandidates(long estimator, int leftSlot, int leftFd, int rightSlot, int rightFd,
                                             ByteBuffer vectors, ByteBuffer candidates);
     /** AHB estimate that also surfaces the static mask and bidirectional visibility. */

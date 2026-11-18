@@ -227,6 +227,23 @@ extern "C" JNIEXPORT jboolean JNICALL QCOMJNI(ahbRetired)(JNIEnv *, jclass, jlon
     return qcom_motion_ahb_retired(motion(pointer)) == 1;
 }
 
+/* Composite-driver wait policy for the submit->retire fence.  Both settings only
+ * change how the CPU observes the existing fence, so neither can alter any
+ * estimator output.  Exposed so the renderer can select the measured-best
+ * strategy without a rebuild. */
+extern "C" JNIEXPORT jint JNICALL QCOMJNI(setWaitStrategy)(JNIEnv *, jclass, jlong pointer,
+                                                           jint strategy)
+{
+    return qcom_motion_set_wait_strategy(motion(pointer), strategy);
+}
+
+extern "C" JNIEXPORT jint JNICALL QCOMJNI(setWaitSpinNs)(JNIEnv *, jclass, jlong pointer,
+                                                        jlong spinNs)
+{
+    if (spinNs < 0) return -1;
+    return qcom_motion_set_wait_spin_ns(motion(pointer), static_cast<uint64_t>(spinNs));
+}
+
 extern "C" JNIEXPORT jint JNICALL QCOMJNI(estimateAhbCandidates)(JNIEnv *env, jclass, jlong pointer,
     jint leftSlot, jint leftFd, jint rightSlot, jint rightFd, jobject vectors, jobject candidates)
 {

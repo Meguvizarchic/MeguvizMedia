@@ -195,6 +195,34 @@ struct QcomMotion {
     /* Opt-in: force zero motion on classified-static cells so the warp blends the
      * two endpoint frames at the same coordinate. */
     bool staticGate = false;
+    /* How the submit->retire fence is awaited.  0 keeps the historical blocking
+     * vkWaitForFences; 1 spins on vkGetFenceStatus first.  The fence covers only
+     * this handle's own single-frame submission, so the interval is dominated by
+     * wakeup latency, and the two strategies retire on the same fence. */
+    int waitStrategy = QCOM_MOTION_WAIT_BLOCK;
+    uint64_t waitSpinNs = QCOM_MOTION_WAIT_SPIN_NS_DEFAULT;
+    /* True when the spin budget should follow the previous frame's retire
+     * interval instead of the fixed waitSpinNs.  See awaitRetire(). */
+    bool waitSpinNsAdaptive = false;
+    /* The instant the previous estimate retired, and whether there is one.  Used
+     * only for the timing report's caller-turnaround figure. */
+    Clock::time_point lastRetired{};
+    bool hasLastRetired = false;
+    /* Filled by awaitRetire() for the timing report of the current estimate. */
+    uint64_t waitSpunNs = 0;
+    uint64_t waitBlockedNs = 0;
+    uint64_t waitPolls = 0;
+    uint64_t spinBudgetNs = 0;
+    /* Previous frame's submit->retire interval, the adaptive spin predictor. */
+    uint64_t lastQueueNs = 0;
+    /* Periodic wait statistics.  The window trace records only JNI durations, so
+     * without this there is no way to tell whether the poll path engaged in the
+     * integrated app or how often the spin fell through to the blocking wait.
+     * One line per kStatsWindow estimates goes to stderr, which logcat carries. */
+    bool statsEnabled = false;
+    uint64_t statsCount = 0, statsQueueSum = 0, statsQueueMax = 0;
+    uint64_t statsSpinSum = 0, statsBlockSum = 0, statsBlockFallbacks = 0;
+    uint64_t statsGpuSum = 0, statsGpuMax = 0;
     bool populated = false;
     bool failed = false;
     bool ahbSubmissionUnknown = false;
@@ -755,12 +783,79 @@ struct QcomMotion {
         timing.gpu_observed = 1;
     }
 
+    /* Awaits this handle's submit fence, reporting how the wait was satisfied.
+     * Returns the CPU instant the fence was observed signalled.
+     *
+     * The only work in flight on this fence is this handle's own command buffer -
+     * one AHB acquire, the pyramid unpack, three block-match levels, visibility,
+     * and the host-read barriers.  Nothing else is ever submitted to this queue,
+     * so there is no queueing behind other work to wait out.  That makes the
+     * interval a pure "how fast does the CPU learn the GPU finished" question,
+     * which is why polling is worth measuring: vkWaitForFences parks the thread
+     * and pays a scheduler wakeup, and that wakeup is the jitter source the window
+     * trace shows as a 21 ms nativeWork tail with a 6.1 ms flat GPU.
+     *
+     * The spin budget is bounded and a blocking wait always follows, so a fence
+     * that is genuinely late still completes rather than timing out. */
+    Clock::time_point awaitRetire()
+    {
+        auto spinBegin = Clock::now();
+        if (waitStrategy == QCOM_MOTION_WAIT_POLL) {
+            /* The budget has to cover the frame's own GPU time, otherwise the spin
+             * expires first and the frame pays the spin *and* the blocking wakeup -
+             * measured as a worse tail than blocking alone.  The previous frame's
+             * retire interval is the best available predictor of this frame's, and
+             * it adapts by itself when the caller switches between the default and
+             * the reducer pipeline (~8.1 ms vs ~6.1 ms of GPU) or when content
+             * makes the fine stage cheaper.  The margin covers run-to-run drift;
+             * the blocking fallback still catches a genuinely late fence. */
+            uint64_t budget = waitSpinNs;
+            if (waitSpinNsAdaptive && lastQueueNs) {
+                constexpr uint64_t margin = 1500000;
+                budget = lastQueueNs + margin;
+                if (budget < 2000000) budget = 2000000;
+            }
+            if (budget > 20000000) budget = 20000000;
+            const auto deadline = spinBegin + std::chrono::nanoseconds(budget);
+            uint64_t polls = 0;
+            for (;;) {
+                ++polls;
+                if (vkGetFenceStatus(device, fence) == VK_SUCCESS) {
+                    auto observed = Clock::now();
+                    spinBudgetNs = budget;
+                    waitSpunNs = nanoseconds(spinBegin, observed);
+                    waitBlockedNs = 0;
+                    waitPolls = polls;
+                    return observed;
+                }
+                if (Clock::now() >= deadline) break;
+            }
+            spinBudgetNs = budget;
+            waitSpunNs = nanoseconds(spinBegin, Clock::now());
+            waitPolls = polls;
+            auto blockBegin = Clock::now();
+            checked(vkWaitForFences(device, 1, &fence, VK_TRUE, 2000000000ULL), "vkWaitForFences");
+            auto observed = Clock::now();
+            waitBlockedNs = nanoseconds(blockBegin, observed);
+            return observed;
+        }
+        checked(vkWaitForFences(device, 1, &fence, VK_TRUE, 2000000000ULL), "vkWaitForFences");
+        auto observed = Clock::now();
+        spinBudgetNs = 0;
+        waitSpunNs = 0;
+        waitBlockedNs = nanoseconds(spinBegin, observed);
+        waitPolls = 1;
+        return observed;
+    }
+
     void estimate(const uint8_t *previous, const uint8_t *current, float *vectors, float *confidence,
                   float *candidates, uint8_t *staticMask, float *visibility,
                   QcomMotionTiming *timing, int candidateMode,
                   const QcomAhbFrame (*inputs)[2] = nullptr)
     {
         auto start = Clock::now();
+        const uint64_t retiredToSubmit = hasLastRetired ? nanoseconds(lastRetired, start) : 0;
+        waitSpunNs = waitBlockedNs = waitPolls = 0;
         if (inputs) ahb->waitOn(*inputs);
         else buildPyramid(previous, current);
         checked(vkResetFences(device, 1, &fence), "vkResetFences");
@@ -818,9 +913,11 @@ struct QcomMotion {
         }
         auto queued = Clock::now();
         checked(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit");
-        checked(vkWaitForFences(device, 1, &fence, VK_TRUE, 2000000000ULL), "vkWaitForFences");
+        auto retired = awaitRetire();
         if (inputs) ahbSubmissionUnknown = false;
-        auto retired = Clock::now();
+        lastRetired = retired;
+        hasLastRetired = true;
+        lastQueueNs = nanoseconds(queued, retired);
         populated = true;
         const auto *matches = static_cast<const Match *>(fine.mapped);
         for (size_t i = 0; i < gridSize; ++i) {
@@ -857,13 +954,75 @@ struct QcomMotion {
         }
         if (visibility)
             std::memcpy(visibility, visibilityBuffer.mapped, visibilityBuffer.size);
+        const uint64_t queueNs = nanoseconds(queued, retired);
         if (timing) {
             *timing = {};
             timing->preparation_ns = nanoseconds(start, queued);
-            timing->queue_ns = nanoseconds(queued, retired);
+            timing->queue_ns = queueNs;
             timing->cpu_readback_ns = nanoseconds(retired, Clock::now());
+            timing->wait_spin_ns = waitSpunNs;
+            timing->wait_block_ns = waitBlockedNs;
+            timing->poll_count = waitPolls;
+            timing->retire_to_submit_ns = retiredToSubmit;
+            timing->wait_strategy = waitStrategy;
+            timing->spin_budget_ns = spinBudgetNs;
             timing->rgba_expanded = format != VK_FORMAT_R8_UNORM;
             readTimestamps(*timing);
+        }
+        if (statsEnabled) {
+            /* gpu_total only exists once the timestamp pool has been read, so this
+             * block runs after readTimestamps rather than beside the memcpys. */
+            /* gpu_total only exists once the timestamp pool has been read.  The JNI
+             * entry points pass a null timing, so the stats path reads the pool
+             * itself into a local struct rather than reporting a spurious zero. */
+            QcomMotionTiming local{};
+            if (!timing) readTimestamps(local);
+            const uint64_t gpuNs = timing ? timing->gpu_total_ns : local.gpu_total_ns;
+            ++statsCount;
+            statsQueueSum += queueNs;
+            if (queueNs > statsQueueMax) statsQueueMax = queueNs;
+            statsSpinSum += waitSpunNs;
+            statsBlockSum += waitBlockedNs;
+            if (waitBlockedNs) ++statsBlockFallbacks;
+            statsGpuSum += gpuNs;
+            if (gpuNs > statsGpuMax) statsGpuMax = gpuNs;
+            constexpr uint64_t kStatsWindow = 30;
+            if (statsCount % kStatsWindow == 0) {
+                /* Window stats: sums and counts are reset below, so the divisor is
+                 * the window length, not the running total. */
+                const double n = double(kStatsWindow);
+                const double queueMean = double(statsQueueSum) / n / 1e6;
+                const double spinMean = double(statsSpinSum) / n / 1e6;
+                const double blockMean = double(statsBlockSum) / n / 1e6;
+                const double gpuMean = double(statsGpuSum) / n / 1e6;
+                std::fprintf(stderr,
+                    "QCOM wait stats n=%llu strategy=%d queue_mean_ms=%.3f queue_max_ms=%.3f "
+                    "spin_mean_ms=%.3f block_mean_ms=%.3f block_fallbacks=%llu "
+                    "gpu_mean_ms=%.3f gpu_max_ms=%.3f\n",
+                    static_cast<unsigned long long>(statsCount), waitStrategy,
+                    queueMean, double(statsQueueMax) / 1e6, spinMean, blockMean,
+                    static_cast<unsigned long long>(statsBlockFallbacks),
+                    gpuMean, double(statsGpuMax) / 1e6);
+                std::fflush(stderr);
+                /* stderr does not reach logcat from a release APK, and the app
+                 * sandbox cannot write /data/local/tmp, so the same line goes to
+                 * the app's own files directory, which `run-as` can read while the
+                 * run is still going.  Writing on this cadence costs a few
+                 * microseconds per frame, far below the measurement resolution. */
+                if (FILE *log = std::fopen("/data/user/0/io.github.jichuo1.meguviz.qcom4kedge/files/qcom-jitter-stats.txt", "a")) {
+                    std::fprintf(log, "n=%llu strategy=%d queue_mean_ms=%.3f queue_max_ms=%.3f "
+                        "spin_mean_ms=%.3f block_mean_ms=%.3f block_fallbacks=%llu "
+                        "gpu_mean_ms=%.3f gpu_max_ms=%.3f\n",
+                        static_cast<unsigned long long>(statsCount), waitStrategy,
+                        queueMean, double(statsQueueMax) / 1e6, spinMean, blockMean,
+                        static_cast<unsigned long long>(statsBlockFallbacks),
+                        gpuMean, double(statsGpuMax) / 1e6);
+                    std::fclose(log);
+                }
+                statsQueueSum = statsQueueMax = statsSpinSum = statsBlockSum = 0;
+                statsBlockFallbacks = 0;
+                statsGpuSum = statsGpuMax = 0;
+            }
         }
     }
 };
@@ -881,6 +1040,28 @@ static void applyStaticOverrides(QcomMotion &motion)
     motion.staticGate = gate != 0;
     readProperty("debug.meguviz.qcom.adaptive.mode", motion.adaptiveMode);
     readProperty("debug.meguviz.qcom.adaptive.confidence", motion.confidenceGateMilli);
+    /* Wait policy is a latency-only switch, so it is exposed as one property:
+     *   0 or absent  blocking vkWaitForFences (historical)
+     *   1            poll with the fixed default budget, then block
+     *   2            poll with the adaptive budget, then block
+     * 2 is what the device A/B picked; 0 keeps an unconfigured handle identical
+     * to the pre-existing library. */
+    int waitMode = 0;
+    readProperty("debug.meguviz.qcom.wait.strategy", waitMode);
+    if (waitMode == 2) {
+        motion.waitStrategy = QCOM_MOTION_WAIT_POLL;
+        motion.waitSpinNsAdaptive = true;
+    } else if (waitMode == 1) {
+        motion.waitStrategy = QCOM_MOTION_WAIT_POLL;
+        motion.waitSpinNsAdaptive = false;
+        motion.waitSpinNs = QCOM_MOTION_WAIT_SPIN_NS_DEFAULT;
+    } else {
+        motion.waitStrategy = QCOM_MOTION_WAIT_BLOCK;
+        motion.waitSpinNsAdaptive = false;
+    }
+    int stats = 0;
+    readProperty("debug.meguviz.qcom.wait.stats", stats);
+    motion.statsEnabled = stats != 0;
     /* The alternate-window gate (modes 2 and 3) is not shipped, so a debug property
      * asking for it is clamped to the reduction-only mode rather than silently
      * running a variant this build cannot reproduce from source. */
@@ -947,6 +1128,29 @@ extern "C" int qcom_motion_set_adaptive(QcomMotion *motion, int mode, int confid
     if (confidence_gate_milli < 0 || confidence_gate_milli > 1000) return -1;
     motion->adaptiveMode = mode;
     motion->confidenceGateMilli = confidence_gate_milli;
+    return 0;
+}
+
+extern "C" int qcom_motion_set_wait_strategy(QcomMotion *motion, int strategy)
+{
+    if (!motion) return -1;
+    if (strategy != QCOM_MOTION_WAIT_BLOCK && strategy != QCOM_MOTION_WAIT_POLL) return -1;
+    motion->waitStrategy = strategy;
+    return 0;
+}
+
+extern "C" int qcom_motion_set_wait_spin_ns(QcomMotion *motion, uint64_t spin_ns)
+{
+    if (!motion) return -1;
+    /* A spin budget beyond one 60 Hz frame cannot help: the blocking fallback
+     * would already have been reached, so clamp instead of rejecting.  Passing 0
+     * selects the adaptive budget, which follows the previous frame's retire
+     * interval instead of a fixed value; the fixed budget is left at the default
+     * so the one frame before the predictor has data still spins usefully. */
+    constexpr uint64_t ceiling = 20ull * 1000 * 1000;
+    motion->waitSpinNsAdaptive = spin_ns == 0;
+    motion->waitSpinNs = spin_ns == 0 ? QCOM_MOTION_WAIT_SPIN_NS_DEFAULT
+                                      : (spin_ns > ceiling ? ceiling : spin_ns);
     return 0;
 }
 

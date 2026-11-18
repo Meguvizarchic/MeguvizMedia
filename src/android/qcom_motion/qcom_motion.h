@@ -50,6 +50,25 @@ typedef struct QcomMotionTiming {
     uint64_t gpu_copy_ns;
     uint64_t gpu_total_ns;
     uint64_t gpu_barrier_ns;
+    /* Appended for the wait-strategy audit; earlier offsets are unchanged.
+     * queue_ns is one opaque "submit -> fence retired" interval.  These four split
+     * it, which is what distinguishes a slow GPU from a slow wakeup:
+     *   wait_spin_ns / wait_block_ns - how the wait was satisfied.  spin is the
+     *     host polling loop (vkGetFenceStatus), block is a blocking
+     *     vkWaitForFences.  A frame that spent time in block and still retired
+     *     late is a scheduling/wakeup problem, not a GPU problem.
+     *   poll_count - vkGetFenceStatus calls in the spin phase.
+     *   retire_to_submit_ns - CPU-side turnaround: from the previous estimate's
+     *     retire to this one's submit, i.e. what the caller did in between. */
+    uint64_t wait_spin_ns;
+    uint64_t wait_block_ns;
+    uint64_t poll_count;
+    uint64_t retire_to_submit_ns;
+    int wait_strategy;
+    /* Spin budget the poll path actually used.  With the adaptive budget this
+     * follows the previous frame's retire interval, so a caller can see whether
+     * the spin covered the frame or fell through to the blocking wait. */
+    uint64_t spin_budget_ns;
 } QcomMotionTiming;
 
 /* Create an independent Vulkan context. Metric: 0=SAD, 1=SSD. */
@@ -145,6 +164,40 @@ int qcom_motion_set_adaptive(QcomMotion *motion, int mode, int confidence_gate_m
  * content.  Disabled by default, which reproduces the pre-existing vectors exactly
  * and keeps staticMask a pure observation. */
 void qcom_motion_set_static_gate(QcomMotion *motion, int enabled);
+
+/* Wait strategy for the submit->retire fence.  The estimator is latency-bound and
+ * the fence only ever covers one frame of its own work, so the retire interval is
+ * dominated by how quickly the CPU notices a signalled fence rather than by GPU
+ * execution.  Both strategies retire on the same fence, so vectors, confidence,
+ * candidates, static mask and visibility are byte-identical; only the timing
+ * differs.
+ *
+ *   QCOM_MOTION_WAIT_BLOCK  historical blocking vkWaitForFences.  Parks the
+ *                           thread, so the retire instant includes a scheduler
+ *                           wakeup.  Default: an unconfigured handle behaves
+ *                           exactly like the pre-existing library.
+ *   QCOM_MOTION_WAIT_POLL   polls vkGetFenceStatus on the calling thread within
+ *                           a bounded budget, then falls back to the blocking
+ *                           wait.  The fallback means a genuinely late fence
+ *                           still completes instead of timing out; the spin only
+ *                           ever replaces a wakeup that would otherwise have
+ *                           happened.
+ *
+ * The budget: qcom_motion_set_wait_spin_ns sets a fixed value (clamped to one
+ * 60 Hz frame); passing 0 selects the adaptive budget, which follows the previous
+ * frame's submit->retire interval plus a margin, clamped 2..20 ms.  The device
+ * A/B picked the adaptive budget (QCOM_MOTION_WAIT_POLL with spin_ns 0).
+ * On Android, debug.meguviz.qcom.wait.strategy selects 0/1/2 (block, fixed,
+ * adaptive) at handle creation and debug.meguviz.qcom.wait.stats=1 appends a
+ * per-30-estimate window statistic to the app's private files directory; both
+ * default to the historical behaviour when unset. */
+enum {
+    QCOM_MOTION_WAIT_BLOCK = 0,
+    QCOM_MOTION_WAIT_POLL = 1,
+    QCOM_MOTION_WAIT_SPIN_NS_DEFAULT = 4000000
+};
+int qcom_motion_set_wait_strategy(QcomMotion *motion, int strategy);
+int qcom_motion_set_wait_spin_ns(QcomMotion *motion, uint64_t spin_ns);
 
 #ifdef __cplusplus
 }
