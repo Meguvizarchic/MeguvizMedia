@@ -156,7 +156,20 @@ int qcom_motion_set_static_thresholds(QcomMotion *motion, int threshold_milli,
  *
  * Returns 0 on success, -1 on a null handle, a mode outside 0..1, or a cut outside
  * 0..1000.  confidence_gate_milli is accepted for signature compatibility with the
- * validated prototype and has no effect while the gate is absent. */
+ * validated prototype and has no effect while the gate is absent.
+ *
+ * On Android, debug.meguviz.qcom.adaptive.mode is read at handle creation:
+ * 0 selects mode 0 (explicit rollback), 1 selects mode 1 (also the default when
+ * the property is absent or unparsable), and values above 1 are clamped to 1.
+ * motion.comp still carries "default=false" on the reducer specialization
+ * constants; that is the compile-time value of the unreduced pipeline variant
+ * and is superseded at runtime by the host-side adaptiveMode=1 default.  The
+ * shader bytes are unchanged.
+ *
+ * Returning to the pre-default-flip behaviour takes both switches:
+ * adaptive.mode=0 (or qcom_motion_set_adaptive(..., 0, ...)) AND wait.strategy=0
+ * (or qcom_motion_set_wait_strategy(..., QCOM_MOTION_WAIT_BLOCK)).  Setting only
+ * the wait strategy disables the spin but leaves the reduction enabled. */
 int qcom_motion_set_adaptive(QcomMotion *motion, int mode, int confidence_gate_milli);
 
 /* Opt-in consumption of the static classification.  When enabled, every cell the
@@ -191,6 +204,10 @@ void qcom_motion_set_static_gate(QcomMotion *motion, int enabled);
  * 60 Hz frame); passing 0 selects the adaptive budget, which follows the previous
  * frame's submit->retire interval plus a margin, clamped 2..20 ms.  The device
  * A/B picked the adaptive budget (QCOM_MOTION_WAIT_POLL with spin_ns 0).
+ * qcom_motion_set_wait_strategy does NOT reset the budget mode: a handle created
+ * with the new defaults keeps waitSpinNsAdaptive=true, so POLL still follows the
+ * previous frame's interval rather than the fixed 4 ms.  Call
+ * qcom_motion_set_wait_spin_ns with a non-zero value to pin the fixed budget.
  * On Android, debug.meguviz.qcom.wait.strategy selects 0/1/2 (block, fixed,
  * adaptive; absent = adaptive) at handle creation and
  * debug.meguviz.qcom.wait.stats=1 appends a

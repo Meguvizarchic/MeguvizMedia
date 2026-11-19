@@ -117,9 +117,11 @@ Java_io_github_jichuo1_meguviz_media_QcomMotionNative_setStaticGate(
     qcom_motion_set_static_gate(reinterpret_cast<QcomMotion *>(handle), enabled ? 1 : 0);
 }
 
-/* Opt-in cost reducers.  Disabled by default, which keeps the estimator
- * byte-identical to the pre-existing build.  The third argument is the
- * parent-confidence cut in thousandths used by the alternate-hypothesis gate;
+/* Cost reducers.  Mode 1 (the default when this module is enabled) runs the
+ * parallel top-two reduction and is byte-identical in output to the unreduced
+ * pipeline; pass enabled=false to fall back to mode 0 explicitly.  The third
+ * argument is the parent-confidence cut in thousandths used by the
+ * alternate-hypothesis gate;
  * pass 250 for the validated default.  Returns 0 on success, -1 on a null
  * handle or an out-of-range cut. */
 extern "C" JNIEXPORT jint JNICALL

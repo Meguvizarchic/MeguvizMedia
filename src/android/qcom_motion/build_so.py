@@ -8,8 +8,8 @@ Usage:
 
 Verified with NDK 30.0.16248370, clang --target=aarch64-linux-android27:
     libmeguviz_qcom_motion.so
-    sha256 f62bb2727840c651391b3aecd5d0e25225b3faf8cfdbdc865977f46b4872b039
-    bytes  1235832
+    sha256 6022dad67c2ab7f14b96f0f74a3ef7081a09194a117cbf5ab4c72cce72890285
+    bytes  1235864
 from the four translation units beside this script (three-level estimator with
 the parallel-reduction pipeline plus the adaptive fence-wait strategy both
 enabled by default, AHB bridge, JNI bridge, candidate projection).
@@ -24,8 +24,8 @@ from pathlib import Path
 import subprocess
 
 HERE = Path(__file__).resolve().parent
-EXPECTED_SHA256 = "f62bb2727840c651391b3aecd5d0e25225b3faf8cfdbdc865977f46b4872b039"
-EXPECTED_BYTES = 1235832
+EXPECTED_SHA256 = "6022dad67c2ab7f14b96f0f74a3ef7081a09194a117cbf5ab4c72cce72890285"
+EXPECTED_BYTES = 1235864
 
 # All inputs live beside this script, so the file works both in this package and
 # after patch 01 places it at src/android/qcom_motion/build_so.py.

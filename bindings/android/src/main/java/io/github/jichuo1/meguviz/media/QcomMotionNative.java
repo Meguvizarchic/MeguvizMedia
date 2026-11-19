@@ -21,9 +21,11 @@ final class QcomMotionNative {
     static native int prepareCandidates(ByteBuffer candidates, ByteBuffer atlas);
     static native void destroy(long handle);
 
-    /** Opt-in parallel top-two reduction. mode is 0 (default) or 1 (reduction);
-     *  modes 2 and 3 are rejected because the alternate-window gate lost its
-     *  quality gate on device. Returns 0 on success, -1 on rejection. */
+    /** Parallel top-two reduction. enabled=true selects mode 1 (default, reduction);
+     *  enabled=false selects mode 0 (explicit rollback). modes 2 and 3 are rejected
+     *  because the alternate-window gate lost its quality gate on device. Both
+     *  shipped modes are byte-identical in output. Returns 0 on success, -1 on
+     *  rejection. */
     static native int setAdaptive(long handle, boolean enabled, int confidenceMilli);
     /** Disables the fine sub-pixel refinement when enabled is false. */
     static native void setSubpixel(long handle, boolean enabled);
@@ -43,8 +45,14 @@ final class QcomMotionNative {
     static native boolean ahbRetired(long estimator);
     /** Composite-driver wait policy for the submit->retire fence.  Only how the CPU
      * observes the existing fence changes; estimator outputs are unaffected.
-     * strategy: 0 = blocking (default), 1 = bounded spin then block.  spinNs 0
-     * selects the adaptive budget (previous frame's retire interval + margin). */
+     * strategy: 1 = bounded spin then block (a default handle uses this with the
+     * adaptive budget), 0 = blocking (explicit rollback). The create-time property
+     * debug.meguviz.qcom.wait.strategy selects 0 = blocking, 1 = fixed spin,
+     * 2 = adaptive (absent = 2).
+     * This setter does not change the budget mode: a new handle keeps the adaptive
+     * budget, so call setWaitSpinNs with a non-zero value for a fixed budget.
+     * spinNs 0 selects the adaptive budget (previous frame's retire interval +
+     * margin). */
     static native int setWaitStrategy(long estimator, int strategy);
     /** Fixed spin budget in ns, clamped to one 60 Hz frame; 0 = adaptive budget. */
     static native int setWaitSpinNs(long estimator, long spinNs);

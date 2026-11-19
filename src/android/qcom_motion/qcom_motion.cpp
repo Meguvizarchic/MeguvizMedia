@@ -463,13 +463,18 @@ struct QcomMotion {
     void initialize(int metric, bool ahbInput = false)
     {
         initializeDevice(ahbInput);
-        /* One line per handle creation recording the reducer mode that is actually
-         * in effect.  The reducers are chosen at create time from a debug property,
-         * so without this a capture cannot prove which variant produced its frames -
-         * and "I thought I switched it" is exactly the failure a quality A/B cannot
-         * afford.  The line goes to stderr, which logcat carries. */
-        std::fprintf(stderr, "QCOM adaptive_mode=%d confidence_milli=%d\n",
-                     adaptiveMode, confidenceGateMilli);
+        /* One line per handle creation recording the reducer and wait modes that
+         * are actually in effect.  Both are chosen at create time from debug
+         * properties, so without this a capture cannot prove which variant
+         * produced its frames - and "I thought I switched it" is exactly the
+         * failure a quality A/B cannot afford.  The wait fields also let a
+         * capture prove the default spin engaged without turning wait.stats on:
+         * wait_strategy is the QCOM_MOTION_WAIT_* value and spin_adaptive is the
+         * budget mode (1 = previous-frame interval, 0 = fixed waitSpinNs).
+         * The line goes to stderr, which logcat carries. */
+        std::fprintf(stderr, "QCOM adaptive_mode=%d confidence_milli=%d wait_strategy=%d spin_adaptive=%d\n",
+                     adaptiveMode, confidenceGateMilli, waitStrategy,
+                     waitSpinNsAdaptive ? 1 : 0);
         const unsigned bytesPerPixel = format == VK_FORMAT_R8_UNORM ? 1 : 4;
         VkDeviceSize stagingSize = 0;
         const VkExtent3D levels[3] = {
