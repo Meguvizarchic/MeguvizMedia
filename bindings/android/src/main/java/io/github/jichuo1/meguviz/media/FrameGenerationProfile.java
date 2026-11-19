@@ -41,7 +41,46 @@ public final class FrameGenerationProfile {
         if (backend == null || pairToDrawP95Ns <= 0) {
             throw new IllegalArgumentException("invalid frame generation qualification");
         }
-        return new Qualification(this, backend, pairToDrawP95Ns);
+        return new Qualification(this, backend, pairToDrawP95Ns, 0, 0, 0, 0);
+    }
+
+    /** Qualifies an exact RIFE configuration at the source frame size. */
+    public Qualification qualifyRife(int syncPath, int flowScale, long pairToDrawP95Ns) {
+        return qualifyRife(width, height, syncPath, flowScale, pairToDrawP95Ns);
+    }
+
+    /** Qualifies RIFE at the measured processing size, which may be smaller than the source. */
+    public Qualification qualifyRife(int processingWidth, int processingHeight, int syncPath,
+                                      int flowScale, long pairToDrawP95Ns) {
+        if (processingWidth <= 0 || processingWidth > width || processingHeight <= 0 || processingHeight > height
+                || (syncPath != AndroidMediaSession.AHB_HOST_WAIT && syncPath != AndroidMediaSession.AHB_GPU_SYNC)
+                || (flowScale != 4 && flowScale != 6 && flowScale != 8) || pairToDrawP95Ns <= 0) {
+            throw new IllegalArgumentException("invalid RIFE qualification");
+        }
+        return new Qualification(this, Backend.RIFE, pairToDrawP95Ns, processingWidth, processingHeight,
+            syncPath, flowScale);
+    }
+
+    /** Choose among already validated configurations within the budget. Prefer the largest processing
+     * extent by pixel count, then finer flow, lower latency, and host wait at equal cost. */
+    public Qualification selectRife(Qualification... variants) {
+        Qualification best = null;
+        for (Qualification variant : variants) {
+            if (usable(variant, Backend.RIFE) && variant.rifePath != 0
+                    && (best == null || prefersRife(variant, best))) best = variant;
+        }
+        return best;
+    }
+
+    private static boolean prefersRife(Qualification candidate, Qualification best) {
+        long pixels = (long) candidate.rifeWidth * candidate.rifeHeight;
+        long bestPixels = (long) best.rifeWidth * best.rifeHeight;
+        if (pixels != bestPixels) return pixels > bestPixels;
+        if (candidate.flowScale != best.flowScale) return candidate.flowScale < best.flowScale;
+        if (candidate.pairToDrawP95Ns != best.pairToDrawP95Ns)
+            return candidate.pairToDrawP95Ns < best.pairToDrawP95Ns;
+        return candidate.rifePath == AndroidMediaSession.AHB_HOST_WAIT
+            && best.rifePath != AndroidMediaSession.AHB_HOST_WAIT;
     }
 
     /** RIFE is preferred when both qualified paths meet the playback budget. */
@@ -67,11 +106,18 @@ public final class FrameGenerationProfile {
         final FrameGenerationProfile profile;
         public final Backend backend;
         public final long pairToDrawP95Ns;
+        /** Exact RIFE processing geometry and options. Zero for legacy and QCOM qualifications. */
+        public final int rifeWidth, rifeHeight, rifePath, flowScale;
 
-        private Qualification(FrameGenerationProfile profile, Backend backend, long pairToDrawP95Ns) {
+        private Qualification(FrameGenerationProfile profile, Backend backend, long pairToDrawP95Ns,
+                              int rifeWidth, int rifeHeight, int rifePath, int flowScale) {
             this.profile = profile;
             this.backend = backend;
             this.pairToDrawP95Ns = pairToDrawP95Ns;
+            this.rifeWidth = rifeWidth;
+            this.rifeHeight = rifeHeight;
+            this.rifePath = rifePath;
+            this.flowScale = flowScale;
         }
 
         boolean fits(long nowNs, long deadlineNs) {

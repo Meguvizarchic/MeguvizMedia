@@ -11,14 +11,33 @@ import java.util.function.Supplier;
 public final class FrameGenerationSession implements WindowBackend {
     static final int DEADLINE_REJECTED = -9, CANCELLED = -13;
     private static final int INFERRED = 2;
+    private static final int SUBMIT_IN_FLIGHT = -1, SUBMIT_DEADLINE = -2, SUBMIT_INPUT_NOT_READY = -3;
+
+    public enum Decision { ACCEPTED, IN_FLIGHT, DEADLINE, INPUT_NOT_READY, BACKEND_REJECTED }
+
+    public static final class Submission {
+        private static final Submission IN_FLIGHT = new Submission(Decision.IN_FLIGHT, 0);
+        private static final Submission DEADLINE = new Submission(Decision.DEADLINE, 0);
+        private static final Submission INPUT_NOT_READY = new Submission(Decision.INPUT_NOT_READY, 0);
+        private static final Submission BACKEND_REJECTED = new Submission(Decision.BACKEND_REJECTED, 0);
+
+        public final Decision decision;
+        /** Positive only for accepted work, which owns a slot until its terminal receipt. */
+        public final long jobId;
+
+        private Submission(Decision decision, long jobId) {
+            this.decision = decision;
+            this.jobId = jobId;
+        }
+    }
 
     private final Thread owner = Thread.currentThread();
     private final FrameGenerationProfile.Qualification qualification;
     private final WindowBackend backend;
     private final LongSupplier clock;
     private long generation = 1;
-    private long jobId, jobGeneration, jobDeadlineNs;
-    private int ownedFrames;
+    private long jobId, jobDeadlineNs;
+    private int discardStatus, ownedFrames;
     private boolean closing, closed;
 
     /**
@@ -30,6 +49,8 @@ public final class FrameGenerationSession implements WindowBackend {
     public static FrameGenerationSession open(FrameGenerationProfile profile,
             FrameGenerationProfile.Qualification rife, Supplier<AndroidMediaSession> preparedRife,
             int flowScale, FrameGenerationProfile.Qualification qcom) {
+        if (rife != null && rife.rifePath != 0)
+            throw new IllegalArgumentException("use openQualified for an exact RIFE configuration");
         FrameGenerationProfile.Qualification choice = profile.select(rife, qcom);
         if (choice != null && choice.backend == FrameGenerationProfile.Backend.RIFE) {
             if (flowScale != 0 && flowScale != 4 && flowScale != 6 && flowScale != 8)
@@ -39,6 +60,31 @@ public final class FrameGenerationSession implements WindowBackend {
                 new RifeWindowSession(session, profile, flowScale), System::nanoTime);
             choice = profile.select(null, qcom);
         }
+        return openQcom(profile, choice);
+    }
+
+    /**
+     * Opens the chosen exact RIFE configuration on the session's EGL owner. Call probe() on the
+     * prepared RIFE session once before this call. The session transfers ownership only when the
+     * returned backend is RIFE. With no prepared RIFE session, try qualified QCOM, then original.
+     */
+    public static FrameGenerationSession openQualified(FrameGenerationProfile profile,
+            FrameGenerationProfile.Qualification rife, AndroidMediaSession preparedRife,
+            FrameGenerationProfile.Qualification qcom) {
+        if (rife != null && rife.rifePath == 0)
+            throw new IllegalArgumentException("exact RIFE qualification required");
+        FrameGenerationProfile.Qualification choice = profile.selectRife(rife);
+        if (choice != null && preparedRife != null) {
+            if (!preparedRife.matchesRifeQualification(choice))
+                throw new IllegalArgumentException("prepared RIFE session does not match its qualified AHB configuration");
+            return new FrameGenerationSession(choice,
+                new RifeWindowSession(preparedRife, profile, choice.flowScale), System::nanoTime);
+        }
+        return openQcom(profile, profile.select(null, qcom));
+    }
+
+    private static FrameGenerationSession openQcom(FrameGenerationProfile profile,
+                                                    FrameGenerationProfile.Qualification choice) {
         if (choice == null) return null;
         try {
             QcomMotionNative.ensureLoaded();
@@ -82,18 +128,37 @@ public final class FrameGenerationSession implements WindowBackend {
     }
 
     @Override public long submit(Object left, Object right, long deadlineNs) {
+        return Math.max(0, admit(left, right, deadlineNs, false));
+    }
+
+    /** Nonblocking admission for hosts that want to distinguish a missed budget from backend pressure.
+     * A rejected pair transfers no resources. The host can keep presenting original frames. */
+    public Submission trySubmit(Object left, Object right, long deadlineNs) {
+        long result = admit(left, right, deadlineNs, true);
+        if (result > 0) return new Submission(Decision.ACCEPTED, result);
+        switch ((int) result) {
+            case SUBMIT_IN_FLIGHT: return Submission.IN_FLIGHT;
+            case SUBMIT_DEADLINE: return Submission.DEADLINE;
+            case SUBMIT_INPUT_NOT_READY: return Submission.INPUT_NOT_READY;
+            default: return Submission.BACKEND_REJECTED;
+        }
+    }
+
+    private long admit(Object left, Object right, long deadlineNs, boolean explainRejection) {
         checkOpen();
         Frame first = source(left), second = source(right);
         if (first.sourceId >= second.sourceId || first.ptsUs >= second.ptsUs)
             throw new IllegalArgumentException("invalid source pair");
-        if (jobId != 0 || !qualification.fits(clock.getAsLong(), deadlineNs)) return 0;
+        if (jobId != 0) return SUBMIT_IN_FLIGHT;
+        if (!qualification.fits(clock.getAsLong(), deadlineNs)) return SUBMIT_DEADLINE;
         long accepted = backend.submit(first.value, second.value, deadlineNs);
         if (accepted > 0) {
             jobId = accepted;
-            jobGeneration = generation;
             jobDeadlineNs = deadlineNs;
+            discardStatus = 0;
+            return accepted;
         }
-        return accepted;
+        return explainRejection && !backend.inputsReady(first.value, second.value) ? SUBMIT_INPUT_NOT_READY : 0;
     }
 
     /**
@@ -104,28 +169,36 @@ public final class FrameGenerationSession implements WindowBackend {
     public void invalidate() {
         checkOpen();
         ++generation;
-        if (jobId != 0) backend.cancel(jobId);
+        if (jobId != 0) discardActive(CANCELLED);
     }
 
     @Override public void cancel(long id) {
         checkOpen();
-        if (id > 0 && id == jobId) {
-            jobGeneration = 0;
-            backend.cancel(id);
-        }
+        if (id > 0 && id == jobId) discardActive(CANCELLED);
+    }
+
+    private void discardActive(int status) {
+        boolean notifyBackend = discardStatus == 0;
+        discardStatus = status;
+        if (notifyBackend) backend.cancel(jobId);
     }
 
     @Override public Completion poll() {
         checkOpen();
         Completion result = backend.poll();
-        if (result == null) return null;
+        if (result == null) {
+            if (jobId != 0 && discardStatus == 0 && jobDeadlineNs - clock.getAsLong() <= 0)
+                discardActive(DEADLINE_REJECTED);
+            return null;
+        }
         if (jobId == 0 || result.jobId != jobId) {
             if (result.frame != null) backend.release(result.frame);
             throw new IllegalStateException("unexpected midpoint completion " + result.jobId);
         }
         jobId = 0;
         int status = result.status;
-        if (status == 0 && jobGeneration != generation) status = CANCELLED;
+        if (discardStatus != 0 && (status == 0 || status == CANCELLED || status == DEADLINE_REJECTED))
+            status = discardStatus;
         if (status == 0 && jobDeadlineNs - clock.getAsLong() <= 0) status = DEADLINE_REJECTED;
         Object output = null;
         if (result.frame != null) {
@@ -161,7 +234,7 @@ public final class FrameGenerationSession implements WindowBackend {
         if (ownedFrames != 0) throw new IllegalStateException("release frame references before close");
         if (!closing) {
             closing = true;
-            if (jobId != 0) backend.cancel(jobId);
+            if (jobId != 0) discardActive(CANCELLED);
         }
         backend.close();
         closed = true;

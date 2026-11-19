@@ -19,6 +19,9 @@ public final class AndroidMediaSession implements AutoCloseable {
         SINK_ACCEPTED = 6, ACTUAL_PRESENTED = 7, OUTPUT_RELEASED = 9;
     private final Thread owner = Thread.currentThread();
     private final HostBridge host;
+    private final int width, height, sourceWidth, sourceHeight, path;
+    private final boolean modelBacked;
+    private boolean ahbProbePassed;
     private long handle, epoch = 1;
     private boolean paused;
     private boolean retirementWakePending, nativeCloseCompleted;
@@ -220,7 +223,8 @@ public final class AndroidMediaSession implements AutoCloseable {
             if(status!=0){error=status;state.compareAndSet(COMMITTING,status==-13?CANCELLED:FAILED);
                 try{if(servicePendingCreation()!=0&&ownerPending!=null)ownerPending.schedule();}catch(Throwable ignored){}return null;}
             try{
-                AndroidMediaSession result=new AndroidMediaSession(receiptId,host);
+                AndroidMediaSession result=new AndroidMediaSession(receiptId,host,width,height,
+                    sourceWidth,sourceHeight,path,engine!=0);
                 if(state.compareAndSet(COMMITTING,COMMITTED)){pendingCreation.remove();ownerPending=null;ownerRetired=true;return result;}
             }catch(RuntimeException|OutOfMemoryError failure){error=-10;state.compareAndSet(COMMITTING,FAILED);}
             try{MediaNative.androidAsyncCancel(receiptId);}catch(Throwable ignored){}
@@ -275,7 +279,17 @@ public final class AndroidMediaSession implements AutoCloseable {
         preparation.start();return preparation;
     }
 
-    private AndroidMediaSession(long existingHandle,HostBridge host){this.host=host;this.handle=existingHandle;}
+    private AndroidMediaSession(long existingHandle, HostBridge host, int width, int height,
+                                int sourceWidth, int sourceHeight, int path, boolean modelBacked) {
+        this.handle = existingHandle;
+        this.host = host;
+        this.width = width;
+        this.height = height;
+        this.sourceWidth = sourceWidth;
+        this.sourceHeight = sourceHeight;
+        this.path = path;
+        this.modelBacked = modelBacked;
+    }
 
     public AndroidMediaSession(long loadedEngine, int width, int height, int poolCapacity,
                                int path, boolean deadlineAdmission, HostBridge host) {
@@ -288,6 +302,12 @@ public final class AndroidMediaSession implements AutoCloseable {
         if (!MediaRuntime.isAttached()) throw new IllegalStateException("Attach the validated library first");
         if (!isCreationProtocolSupported()) throw new LinkageError("Unsupported Android Media creation protocol");
         this.host = host;
+        this.width = width;
+        this.height = height;
+        this.sourceWidth = sourceWidth;
+        this.sourceHeight = sourceHeight;
+        this.path = path;
+        this.modelBacked = loadedEngine != 0;
         if (pendingCreation.get() != null && servicePendingCreation() != 0) throw new MediaException(-7);
         PendingCreation attempt = new PendingCreation();
         pendingCreation.set(attempt);
@@ -346,7 +366,26 @@ public final class AndroidMediaSession implements AutoCloseable {
     }
     /** Probe fields follow MgmAndroidProbe, with status as the first element.
      * workloadQualified remains zero until a separately recorded device gate. */
-    public long[] probe() { owner(); return MediaNative.androidProbe(handle); }
+    public long[] probe() {
+        owner();
+        long[] result = MediaNative.androidProbe(handle);
+        if (validAhbProbe(result, width, height, path)) ahbProbePassed = true;
+        return result;
+    }
+
+    static boolean validAhbProbe(long[] result, int width, int height, int path) {
+        if (width <= 0 || height <= 0 || result == null || result.length < 13 || result[0] != 0
+                || result[1] != width || result[2] != height || result[3] < width
+                || result[6] != 0 || result[7] != 0 || result[8] != 0 || result[9] != 0) return false;
+        return path == AHB_HOST_WAIT || (path == AHB_GPU_SYNC && result[10] == 0 && result[11] == 0);
+    }
+
+    boolean matchesRifeQualification(FrameGenerationProfile.Qualification qualification) {
+        owner();
+        return modelBacked && ahbProbePassed && path == qualification.rifePath
+            && width == qualification.rifeWidth && height == qualification.rifeHeight
+            && sourceWidth == qualification.profile.width && sourceHeight == qualification.profile.height;
+    }
     /** Actual immutable RGBA8 plan JSON, or an empty string if unavailable
      * (including model-free identity sessions). This is not per-job data. */
     public String executionInfo() { owner(); return MediaNative.androidExecutionInfo(handle); }

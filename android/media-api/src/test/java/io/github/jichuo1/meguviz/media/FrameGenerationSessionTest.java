@@ -6,13 +6,14 @@ import static org.junit.Assert.*;
 public class FrameGenerationSessionTest {
     private static final class Backend implements WindowBackend {
         long submitted, cancelled;
-        int draws, releases, closeCalls;
-        boolean busyOnClose;
+        int draws, releases, closeCalls, cancelCalls;
+        boolean busyOnClose, inputsReady = true, refuse;
         Completion completion;
 
         @Override public Object capture(int oes, float[] transform, long sourceId, long ptsUs) { return new Object(); }
-        @Override public long submit(Object left, Object right, long deadlineNs) { return ++submitted; }
-        @Override public void cancel(long jobId) { cancelled = jobId; }
+        @Override public boolean inputsReady(Object left, Object right) { return inputsReady; }
+        @Override public long submit(Object left, Object right, long deadlineNs) { return refuse ? 0 : ++submitted; }
+        @Override public void cancel(long jobId) { cancelled = jobId; cancelCalls++; }
         @Override public Completion poll() { Completion result = completion; completion = null; return result; }
         @Override public void draw(Object frame, int width, int height) { draws++; }
         @Override public void release(Object frame) { releases++; }
@@ -28,6 +29,51 @@ public class FrameGenerationSessionTest {
     private long now = 1000;
     private final FrameGenerationSession session = new FrameGenerationSession(
         profile.qualify(FrameGenerationProfile.Backend.QCOM_AHB, 20), backend, () -> now);
+
+    @Test public void submissionDecisionDistinguishesDeadlineReadinessAndPressure() {
+        Object left = session.capture(1, null, 1, 0);
+        Object right = session.capture(1, null, 2, 33);
+        assertEquals(FrameGenerationSession.Decision.DEADLINE, session.trySubmit(left, right, now + 19).decision);
+        backend.refuse = true;
+        backend.inputsReady = false;
+        assertEquals(FrameGenerationSession.Decision.INPUT_NOT_READY, session.trySubmit(left, right, now + 20).decision);
+        backend.inputsReady = true;
+        assertEquals(FrameGenerationSession.Decision.BACKEND_REJECTED, session.trySubmit(left, right, now + 20).decision);
+        assertEquals(0, session.submit(left, right, now + 20));
+        backend.refuse = false;
+        FrameGenerationSession.Submission accepted = session.trySubmit(left, right, now + 20);
+        assertEquals(FrameGenerationSession.Decision.ACCEPTED, accepted.decision);
+        assertEquals(1, accepted.jobId);
+        assertEquals(FrameGenerationSession.Decision.IN_FLIGHT, session.trySubmit(left, right, now + 20).decision);
+        backend.complete(2);
+        session.release(session.poll().frame);
+        session.release(left);
+        session.release(right);
+        session.close();
+    }
+
+    @Test public void deadlineRequestsSingleCancellationAndPreservesRetirementSlot() {
+        Object left = session.capture(1, null, 1, 0);
+        Object right = session.capture(1, null, 2, 33);
+        long deadline = now + 20;
+        long job = session.submit(left, right, deadline);
+        assertNull(session.poll());
+        assertEquals(0, backend.cancelCalls);
+        now = deadline;
+        assertNull(session.poll());
+        assertNull(session.poll());
+        assertEquals(1, backend.cancelCalls);
+        assertEquals(job, backend.cancelled);
+        assertEquals(FrameGenerationSession.Decision.IN_FLIGHT, session.trySubmit(left, right, now + 24).decision);
+        session.draw(right, 1280, 720);
+        assertEquals(1, backend.draws);
+        backend.completion = new WindowBackend.Completion(job, FrameGenerationSession.CANCELLED, 0, null, 3);
+        assertEquals(FrameGenerationSession.DEADLINE_REJECTED, session.poll().status);
+        assertEquals(2, session.submit(left, right, now + 24));
+        session.release(left);
+        session.release(right);
+        session.close();
+    }
 
     @Test public void lateWorkDoesNotPreventDrawingAnOriginal() {
         Object left = session.capture(1, null, 1, 0);
