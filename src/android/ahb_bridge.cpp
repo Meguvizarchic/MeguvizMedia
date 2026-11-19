@@ -221,14 +221,28 @@ int64_t now_ns(){timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return int64_t(t
 bool extension(const char *all,const char *name){if(!all)return false;size_t n=std::strlen(name);for(auto p=std::strstr(all,name);p;p=std::strstr(p+n,name))if((p==all||p[-1]==' ')&&(p[n]==0||p[n]==' '))return true;return false;}
 std::atomic<uint64_t> next_allocation{uint64_t(1)<<48},next_content{1};
 struct GuardGridSampling {
-    uint32_t static_step,duplicate_x,duplicate_y;
-    GuardGridSampling(uint32_t width,uint32_t height)
-        :static_step(std::max(4u,width/320)),duplicate_x(std::max(1u,width/320)),duplicate_y(std::max(1u,height/180)){}
-    bool shares_duplicate_samples()const{return static_step==duplicate_x&&static_step==duplicate_y;}
+    struct Grid {
+        uint32_t width=0,height=0;
+        uint32_t pixels() const { return width*height; }
+        size_t bytes() const { return size_t(pixels())*4; }
+    };
+    Grid static_grid,scene_grid,duplicate_grid,atlas;
+
+    void configure(uint32_t width,uint32_t height){
+        const auto static_step=std::max(4u,width/320);
+        const auto duplicate_x=std::max(1u,width/320),duplicate_y=std::max(1u,height/180);
+        static_grid={(width+static_step-1)/static_step,(height+static_step-1)/static_step};
+        scene_grid={std::min(width,64u),std::min(height,36u)};
+        if(static_step!=duplicate_x||static_step!=duplicate_y)
+            duplicate_grid={(width+duplicate_x-1)/duplicate_x,(height+duplicate_y-1)/duplicate_y};
+        const auto count=static_grid.pixels()+scene_grid.pixels()+duplicate_grid.pixels();
+        atlas.width=std::min(count,512u);
+        atlas.height=(count+atlas.width-1)/atlas.width;
+    }
 };
 struct Slot {
     std::atomic<uint32_t> pins{0};AHardwareBuffer *buffer=nullptr;EGLImageKHR image=EGL_NO_IMAGE_KHR;GLuint texture=0,fbo=0;
-    uint64_t allocation=0,generation=0,content=0;std::vector<uint8_t> static_grid,scene_grid,duplicate_grid;
+    uint64_t allocation=0,generation=0,content=0;std::vector<uint8_t> guard_samples;
     MgcResource *resource=nullptr;MgcLease *pending_producer=nullptr;uint64_t capacity=0;
     int producer_retirement=-1,resource_retirement=-1;
 };
@@ -273,6 +287,9 @@ struct MgmAndroidSession {
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC target_image=nullptr;PFNEGLCREATESYNCKHRPROC create_sync=nullptr;PFNEGLDESTROYSYNCKHRPROC destroy_sync=nullptr;
     PFNEGLCLIENTWAITSYNCKHRPROC client_wait=nullptr;PFNEGLWAITSYNCKHRPROC wait_sync=nullptr;PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_fence=nullptr;
     GLuint capture=0,display_program=0,sample=0,vao=0,sample_texture=0,sample_fbo=0,vertex_shader=0,fragment_shader=0;bool native_fence=false,gl_cleanup_uncertain=false,poll_active=false;EGLSyncKHR uncertain_sync=EGL_NO_SYNC_KHR;
+    GLint capture_transform=-1;
+    GuardGridSampling guard_grid;
+    bool sample_ready=false;
     bool usable()const{return !gl_cleanup_uncertain;}
     bool operation_active=false,closing=false,domain_released=false;
     int domain_retirement=-1;
@@ -335,20 +352,27 @@ struct MgmAndroidSession {
                 slot->pending_producer=nullptr;slot->producer_retirement=index;waiting=MGC_BUSY;}
             else{mgc_lease_release(slot->pending_producer);slot->pending_producer=nullptr;if(!current()){gl_cleanup_uncertain=true;return MGC_INTERNAL_ERROR;}}}}
         return waiting;}
-    MgcStatus sample_grid(Slot &slot,uint32_t w,uint32_t h,int mode,std::vector<uint8_t> &bytes,CheckedGlState &state){
+    MgcStatus sample_guards(Slot &slot,CheckedGlState &state){
         if(!state.ready())return MGC_INTERNAL_ERROR;
-        glBindTexture(GL_TEXTURE_2D,sample_texture);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
-        glBindFramebuffer(GL_FRAMEBUFFER,sample_fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,sample_texture,0);
-        const auto framebuffer=glCheckFramebufferStatus(GL_FRAMEBUFFER);auto status=state.checkpoint();if(status)return status;
-        if(framebuffer!=GL_FRAMEBUFFER_COMPLETE)return MGC_UNSUPPORTED_CAPABILITY;
-        glViewport(0,0,w,h);glUseProgram(sample);glUniform1i(glGetUniformLocation(sample,"mode"),mode);
-        glUniform2i(glGetUniformLocation(sample,"extent"),desc.width,desc.height);glUniform2i(glGetUniformLocation(sample,"grid"),w,h);
+        const auto& atlas=guard_grid.atlas;
+        slot.guard_samples.resize(atlas.bytes());
+        glBindFramebuffer(GL_FRAMEBUFFER,sample_fbo);
+        if(!sample_ready){
+            glBindTexture(GL_TEXTURE_2D,sample_texture);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,atlas.width,atlas.height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+            glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,sample_texture,0);
+            const auto framebuffer=glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            const auto status=state.checkpoint();if(status)return status;
+            if(framebuffer!=GL_FRAMEBUFFER_COMPLETE)return MGC_UNSUPPORTED_CAPABILITY;
+            sample_ready=true;
+        }
+        glViewport(0,0,atlas.width,atlas.height);glUseProgram(sample);
         glBindTexture(GL_TEXTURE_2D,slot.texture);glDrawArrays(GL_TRIANGLES,0,3);
-        status=state.checkpoint();if(status)return status;
-        bytes.resize(size_t(w)*h*4);
+        const auto status=state.checkpoint();if(status)return status;
         // PACK PBO/row/skip and UNPACK PBO are normalized by the transaction;
         // no external callback runs between its begin and this client read.
-        glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,bytes.data());return state.checkpoint();
+        glReadPixels(0,0,atlas.width,atlas.height,GL_RGBA,GL_UNSIGNED_BYTE,slot.guard_samples.data());
+        return state.checkpoint();
     }
 };
 struct SessionOperation {
@@ -509,7 +533,54 @@ static MgcStatus android_session_create_impl(const MgmAndroidSessionDesc *source
         "+texture(tex,at(base+vec2(offset.x,-offset.y)))+texture(tex,at(base+vec2(-offset.x,offset.y)))"
         "+texture(tex,at(base+offset)));else color=texture(tex,transformed);}",1,s->vertex_shader,s->fragment_shader,s->capture,s->gl_cleanup_uncertain))return abandon(s->gl_cleanup_uncertain?MGC_INTERNAL_ERROR:MGC_UNSUPPORTED_CAPABILITY);
     if(!program("#version 300 es\nprecision highp float;in vec2 uv;uniform sampler2D tex;out vec4 color;void main(){color=texture(tex,uv);}",2,s->vertex_shader,s->fragment_shader,s->display_program,s->gl_cleanup_uncertain))return abandon(s->gl_cleanup_uncertain?MGC_INTERNAL_ERROR:MGC_UNSUPPORTED_CAPABILITY);
-    if(!program("#version 300 es\nprecision highp float;precision highp int;uniform sampler2D tex;uniform int mode;uniform ivec2 extent,grid;out vec4 color;void main(){ivec2 g=ivec2(gl_FragCoord.xy);ivec2 p=mode==0?g*max(4,extent.x/320):(mode==1?((g*2+1)*extent)/(grid*2):g*ivec2(max(1,extent.x/320),max(1,extent.y/180)));color=texelFetch(tex,min(p,extent-1),0);}",0,s->vertex_shader,s->fragment_shader,s->sample,s->gl_cleanup_uncertain))return abandon(s->gl_cleanup_uncertain?MGC_INTERNAL_ERROR:MGC_UNSUPPORTED_CAPABILITY);
+    // Store the grids in their original row-major order, back to back in
+    // one texture. The final partial atlas row is ignored by comparison.
+    if(!program(R"glsl(#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D tex;
+uniform ivec2 extent;
+uniform ivec4 atlas; // stride, static end, scene end, logical end
+uniform ivec4 grids; // static width, scene width/height, duplicate width
+out vec4 color;
+void main() {
+    ivec2 fragment = ivec2(gl_FragCoord.xy);
+    int index = fragment.y * atlas.x + fragment.x;
+    if (index >= atlas.w) { color = vec4(0.0); return; }
+    ivec2 p;
+    if (index < atlas.y) {
+        ivec2 g = ivec2(index % grids.x, index / grids.x);
+        p = g * max(4, extent.x / 320);
+    } else if (index < atlas.z) {
+        index -= atlas.y;
+        ivec2 g = ivec2(index % grids.y, index / grids.y);
+        p = ((g * 2 + 1) * extent) / (grids.yz * 2);
+    } else {
+        index -= atlas.z;
+        ivec2 g = ivec2(index % grids.w, index / grids.w);
+        p = g * max(ivec2(1), extent / ivec2(320, 180));
+    }
+    color = texelFetch(tex, min(p, extent - 1), 0);
+}
+)glsl",0,s->vertex_shader,s->fragment_shader,s->sample,s->gl_cleanup_uncertain))return abandon(s->gl_cleanup_uncertain?MGC_INTERNAL_ERROR:MGC_UNSUPPORTED_CAPABILITY);
+    const bool downscale=d.source_width>=d.width*3/2||d.source_height>=d.height*3/2;
+    const int flip=(d.transform_flags&MGM_ANDROID_CANONICAL_TOP_DOWN)?1:0;
+    glUseProgram(s->capture);
+    s->capture_transform=glGetUniformLocation(s->capture,"transform");
+    glUniform1i(glGetUniformLocation(s->capture,"downscale"),downscale?1:0);
+    glUniform1i(glGetUniformLocation(s->capture,"flipY"),flip);
+    // Match FrameGlCapture's quarter-pixel offsets before applying transform.
+    glUniform2f(glGetUniformLocation(s->capture,"offset"),0.25f/float(d.width),0.25f/float(d.height));
+    glUseProgram(s->display_program);
+    glUniform1i(glGetUniformLocation(s->display_program,"flipY"),flip);
+    s->guard_grid.configure(d.width,d.height);
+    const auto& grid=s->guard_grid;
+    const auto static_end=grid.static_grid.pixels(),scene_end=static_end+grid.scene_grid.pixels();
+    glUseProgram(s->sample);
+    glUniform2i(glGetUniformLocation(s->sample,"extent"),d.width,d.height);
+    glUniform4i(glGetUniformLocation(s->sample,"atlas"),grid.atlas.width,static_end,scene_end,scene_end+grid.duplicate_grid.pixels());
+    glUniform4i(glGetUniformLocation(s->sample,"grids"),grid.static_grid.width,grid.scene_grid.width,grid.scene_grid.height,
+        std::max(1u,grid.duplicate_grid.width));
     glGenTextures(1,&s->sample_texture);glGenFramebuffers(1,&s->sample_fbo);
     if(glGetError()!=GL_NO_ERROR){s->gl_cleanup_uncertain=true;return abandon(MGC_INTERNAL_ERROR);}
     try{s->slots.reserve(d.pool_capacity);s->pending.reserve(2);s->unused_reservations.reserve(2);for(uint32_t i=0;i<d.pool_capacity;++i){
@@ -689,13 +760,7 @@ MgcStatus mgm_android_capture_oes(MgmAndroidSession *s,const MgmAndroidCapture *
         if(!s->destroy_sync(s->display,ready)){s->uncertain_sync=ready;return transaction_failure(MGC_INTERNAL_ERROR);}
         status=state.checkpoint();if(status)return transaction_failure(status);
     }
-    glBindFramebuffer(GL_FRAMEBUFFER,slot->fbo);glViewport(0,0,s->desc.width,s->desc.height);glUseProgram(s->capture);glUniformMatrix4fv(glGetUniformLocation(s->capture,"transform"),1,GL_FALSE,c.texture_transform);
-    // Match FrameGlCapture exactly: four bilinear samples at the canonical
-    // base coordinate +/- 1/4 output pixel, transformed only after the offset.
-    const bool downscale=s->desc.source_width>=s->desc.width*3/2||s->desc.source_height>=s->desc.height*3/2;
-    glUniform1i(glGetUniformLocation(s->capture,"downscale"),downscale?1:0);
-    glUniform1i(glGetUniformLocation(s->capture,"flipY"),(s->desc.transform_flags&MGM_ANDROID_CANONICAL_TOP_DOWN)?1:0);
-    glUniform2f(glGetUniformLocation(s->capture,"offset"),0.25f/float(s->desc.width),0.25f/float(s->desc.height));
+    glBindFramebuffer(GL_FRAMEBUFFER,slot->fbo);glViewport(0,0,s->desc.width,s->desc.height);glUseProgram(s->capture);glUniformMatrix4fv(s->capture_transform,1,GL_FALSE,c.texture_transform);
     auto failed_after_draw=[&](MgcStatus cause){
         // A recoverable ordinary error still needs a real fence for any prior
         // capture commands. Do not create/flush/restore on unknown context.
@@ -709,16 +774,7 @@ MgcStatus mgm_android_capture_oes(MgmAndroidSession *s,const MgmAndroidCapture *
     };
     glBindTexture(GL_TEXTURE_EXTERNAL_OES,c.oes_texture);glDrawArrays(GL_TRIANGLE_STRIP,0,4);status=state.checkpoint();
     if(status)return failed_after_draw(status);
-    const GuardGridSampling grid(s->desc.width,s->desc.height);
-    const uint32_t step=grid.static_step,sx=grid.duplicate_x,sy=grid.duplicate_y;
-    try{
-        status=s->sample_grid(*slot,(s->desc.width+step-1)/step,(s->desc.height+step-1)/step,0,slot->static_grid,state);
-        if(!status)status=s->sample_grid(*slot,std::min(s->desc.width,64u),std::min(s->desc.height,36u),1,slot->scene_grid,state);
-        // Shader modes 0 and 2 use the same texel origins and clamping when
-        // both duplicate steps equal the static step.
-        if(!status&&!grid.shares_duplicate_samples())
-            status=s->sample_grid(*slot,(s->desc.width+sx-1)/sx,(s->desc.height+sy-1)/sy,2,slot->duplicate_grid,state);
-    }catch(...){status=MGC_OUT_OF_MEMORY;}
+    try{status=s->sample_guards(*slot,state);}catch(...){status=MGC_OUT_OF_MEMORY;}
     if(status)return failed_after_draw(status);
     EGLSyncKHR fence=s->create_sync(s->display,s->native_fence?EGL_SYNC_NATIVE_FENCE_ANDROID:EGL_SYNC_FENCE_KHR,nullptr);
     if(fence==EGL_NO_SYNC_KHR)return transaction_failure(MGC_INTERNAL_ERROR);
@@ -747,12 +803,17 @@ MgcStatus mgm_android_capture_oes(MgmAndroidSession *s,const MgmAndroidCapture *
 MgcStatus mgm_android_compare_inputs(MgmAndroidSession *s,MgmFrame *a,MgmFrame *b,MgmAndroidGuardResult *out){
     if(!s||!s->current())return MGC_INVALID_ARGUMENT;SessionOperation operation(s);if(!operation||s->closing||s->initializing)return MGC_BUSY;if(!s->usable())return MGC_INTERNAL_ERROR;MgmAndroidGuardResult result{};uint32_t size=0;auto status=mgm_detail::copy_desc(out,sizeof(result),result,&size);if(status)return status;Slot *found[2]{};MgmFrame *frames[2]={a,b};
     for(int i=0;i<2;++i){MgmFrameDesc d{};d.header=MGC_HEADER_INIT(MgmFrameDesc);status=mgm_frame_describe(frames[i],&d);if(status)return status;if(d.epoch!=s->desc.epoch)return MGC_CANCELLED;MgcLeaseInfo l{};l.header=MGC_HEADER_INIT(MgcLeaseInfo);status=mgc_lease_info(d.content,&l);if(status)return status;for(auto &slot:s->slots)if(slot->allocation==l.allocation_id&&slot->generation==l.allocation_generation&&slot->content==l.content_id)found[i]=slot.get();if(!found[i])return MGC_INVALID_ARGUMENT;}
-    const auto &x=found[0]->static_grid,&y=found[1]->static_grid;uint64_t sum=0,count=0;bool bounded=true;for(size_t i=0;i<x.size();i+=4)for(int c=0;c<3;++c){int d=std::abs(int(x[i+c])-int(y[i+c]));sum+=d;++count;if(d>6)bounded=false;}result.is_static=bounded&&count&&sum*2<=count;
-    const auto &p=found[0]->scene_grid,&q=found[1]->scene_grid;int bins[48]{};uint64_t difference=0,changed=0;for(size_t i=0;i<p.size();i+=4){int pixel=0;for(int c=0;c<3;++c){int av=p[i+c],bv=q[i+c];++bins[c*16+(av>>4)];--bins[c*16+(bv>>4)];pixel+=std::abs(av-bv);}difference+=pixel;if(pixel>=120)++changed;}uint64_t hist=0;for(int v:bins)hist+=std::abs(v);uint64_t samples=p.size()/4;result.is_cut=!result.is_static&&samples&&changed*10>=samples*7&&difference>=samples*135&&hist*100>=samples*6*45;
-    const bool shared=GuardGridSampling(s->desc.width,s->desc.height).shares_duplicate_samples();
-    const auto &u=shared?x:found[0]->duplicate_grid,&v=shared?y:found[1]->duplicate_grid;uint64_t dup_sum=0,dup_count=0,noisy=0;bool dup_max=true;for(size_t i=0;i<u.size();i+=4)for(int c=0;c<3;++c){int d=std::abs(int(u[i+c])-int(v[i+c]));if(d>16)dup_max=false;if(d>4)++noisy;dup_sum+=d;++dup_count;}result.is_duplicate=dup_max&&dup_count&&dup_sum*10<=dup_count*3&&noisy*200<=dup_count;
-    result.sampled_readback_bytes=x.size()+y.size()+p.size()+q.size();
-    if(!shared)result.sampled_readback_bytes+=u.size()+v.size();
+    const auto& grid=s->guard_grid;
+    const size_t static_bytes=grid.static_grid.bytes(),scene_bytes=grid.scene_grid.bytes();
+    const size_t duplicate_bytes=grid.duplicate_grid.bytes(),scene_end=static_bytes+scene_bytes;
+    if(found[0]->guard_samples.size()!=grid.atlas.bytes()||found[1]->guard_samples.size()!=grid.atlas.bytes())return MGC_INTERNAL_ERROR;
+    const auto* x=found[0]->guard_samples.data();const auto* y=found[1]->guard_samples.data();
+    uint64_t sum=0,count=0;bool bounded=true;for(size_t i=0;i<static_bytes;i+=4)for(int c=0;c<3;++c){int d=std::abs(int(x[i+c])-int(y[i+c]));sum+=d;++count;if(d>6)bounded=false;}result.is_static=bounded&&count&&sum*2<=count;
+    int bins[48]{};uint64_t difference=0,changed=0;for(size_t i=static_bytes;i<scene_end;i+=4){int pixel=0;for(int c=0;c<3;++c){int av=x[i+c],bv=y[i+c];++bins[c*16+(av>>4)];--bins[c*16+(bv>>4)];pixel+=std::abs(av-bv);}difference+=pixel;if(pixel>=120)++changed;}uint64_t hist=0;for(int v:bins)hist+=std::abs(v);uint64_t samples=grid.scene_grid.pixels();result.is_cut=!result.is_static&&samples&&changed*10>=samples*7&&difference>=samples*135&&hist*100>=samples*6*45;
+    const size_t duplicate_start=duplicate_bytes?scene_end:0;
+    const size_t duplicate_end=duplicate_bytes?scene_end+duplicate_bytes:static_bytes;
+    uint64_t dup_sum=0,dup_count=0,noisy=0;bool dup_max=true;for(size_t i=duplicate_start;i<duplicate_end;i+=4)for(int c=0;c<3;++c){int d=std::abs(int(x[i+c])-int(y[i+c]));if(d>16)dup_max=false;if(d>4)++noisy;dup_sum+=d;++dup_count;}result.is_duplicate=dup_max&&dup_count&&dup_sum*10<=dup_count*3&&noisy*200<=dup_count;
+    result.sampled_readback_bytes=2*grid.atlas.bytes();
     mgm_detail::write_desc(out,result,size);return MGC_SUCCESS;
 }
 MgcStatus mgm_android_draw(MgmAndroidSession *s,MgmFrame *frame,uint32_t width,uint32_t height){
@@ -802,7 +863,7 @@ MgcStatus mgm_android_draw(MgmAndroidSession *s,MgmFrame *frame,uint32_t width,u
         if(!waited)return before_draw_failure(MGC_INTERNAL_ERROR);
     }
     status=s->image(buffer,read.image,read.texture);if(!s->current()){s->gl_cleanup_uncertain=true;return before_draw_failure(MGC_INTERNAL_ERROR);}if(status)return before_draw_failure(status);
-    glViewport(0,0,width,height);glUseProgram(s->display_program);glUniform1i(glGetUniformLocation(s->display_program,"flipY"),(s->desc.transform_flags&MGM_ANDROID_CANONICAL_TOP_DOWN)?1:0);
+    glViewport(0,0,width,height);glUseProgram(s->display_program);
     mgm_frame_retain(frame);read.submitted=true;glDrawArrays(GL_TRIANGLE_STRIP,0,4);const auto draw_status=transaction.checkpoint();
     if(transaction.unsafe()||!s->current()){s->gl_cleanup_uncertain=true;read.cleanup_uncertain=true;s->pending.push_back(read);return draw_status?draw_status:MGC_INTERNAL_ERROR;}
     read.fence=s->create_sync(s->display,s->native_fence?EGL_SYNC_NATIVE_FENCE_ANDROID:EGL_SYNC_FENCE_KHR,nullptr);
