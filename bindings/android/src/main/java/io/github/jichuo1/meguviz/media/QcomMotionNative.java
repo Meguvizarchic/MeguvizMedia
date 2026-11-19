@@ -8,6 +8,9 @@ final class QcomMotionNative {
 
     private QcomMotionNative() {}
 
+    /** Invoking this method initializes the optional native library before allocating GL resources. */
+    static void ensureLoaded() {}
+
     static native long create();
     static native int estimate(long handle, ByteBuffer previousR8, ByteBuffer currentR8,
                                ByteBuffer vectors, ByteBuffer confidence);

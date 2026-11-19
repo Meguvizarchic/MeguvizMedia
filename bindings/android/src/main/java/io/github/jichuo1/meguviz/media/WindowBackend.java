@@ -11,6 +11,8 @@ public interface WindowBackend extends AutoCloseable {
 
     /** Returns zero if this pair cannot be admitted. A positive ID has one terminal poll receipt. */
     long submit(Object left, Object right, long deadlineNs);
+    /** Advisory cancellation. An accepted job still retires through poll or close. */
+    default void cancel(long jobId) {}
 
     /** Returns null when no completion is currently deliverable. */
     Completion poll();

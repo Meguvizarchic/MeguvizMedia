@@ -25,3 +25,13 @@ android/gradlew.bat :media-rife-jni:assembleRelease :sample-player:assembleDebug
 ```
 
 受控回退：应用停止新任务、取消/提升 epoch、继续 poll 直到 accepted 工作退役、释放 owned frames 与 GL 读取，close 成功后恢复宿主 OES/旧 ByteBuffer 路径。TIMEOUT/BUSY 时保留对象，不能强行释放 GPU 正在读取的资源。
+
+## RIFE 与 QCOM 的统一 Android 入口
+
+`FrameGenerationSession` 在同一个 EGL owner 上提供 OES 采集、异步中间帧提交、轮询、绘制和回收。RIFE 复用已准备好的 `AndroidMediaSession` 和原生 effect。QCOM 复用紧凑 AHB 亮度及现有 GLES warp，按当前输出尺寸映射源纹理坐标。QCOM JNI 仍是单独的可选库，宿主按 ABI 显式打包 `libmeguviz_qcom_motion.so`。缺少库、估计器或紧凑 AHB 预检不通过时，入口返回空会话。
+
+宿主用本次播放的源尺寸、输出尺寸、颜色、帧率和中间帧预算构造 `FrameGenerationProfile`。完成真实设备的能力和画质验证后，再登记对应后端从帧对就绪到绘制提交的实测 p95，包含测量中使用的后端参数和余量。两路都满足预算时优先 RIFE。QCOM 还要求 8 位 BT.709 SDR。在尺寸、颜色、帧率或设备变化时重新建会话并验证资格。
+
+宿主保有播放和音频时钟，先保障原帧。准入拒绝或结果过期时，直接使用宿主原帧路径。源 PTS 回跳或拖动时调用 `invalidate()`，释放旧引用并继续轮询已接受任务直到收到完成回执。不再使用该后端时，停止提交和释放引用，再在原 EGL owner 上关闭会话。关闭返回暂时繁忙或回收未证明时，保留 EGL owner 和上下文，继续完成回收。
+
+绘制回执只证明 GLES 提交。宿主启用前仍需验证持续播放、骤切和遮挡画质、实际显示时序，以及拖动和切清晰度的音画同步。

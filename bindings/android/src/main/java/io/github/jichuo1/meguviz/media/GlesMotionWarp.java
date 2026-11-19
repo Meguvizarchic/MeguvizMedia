@@ -14,6 +14,9 @@ import java.util.concurrent.TimeoutException;
 
 /** Offloads compact luma estimation to Vulkan and retains full-resolution original pixels on the GPU. */
 public final class GlesMotionWarp implements WindowBackend {
+    static final class Unsupported extends IllegalStateException {
+        Unsupported(String message) { super(message); }
+    }
     private static final int DEFAULT_WIDTH = 3840, DEFAULT_HEIGHT = 2160;
     private static final int LUMA_W = 480, LUMA_H = 272, GRID_W = 60, GRID_H = 34, TILE = 8;
     private static final int GRID_CELLS = GRID_W * GRID_H;
@@ -425,6 +428,16 @@ public final class GlesMotionWarp implements WindowBackend {
         return fragment;
     }
 
+    static String warpFragment(int width, int height, int outputWidth, int outputHeight, int options) {
+        String fragment = warpFragment(width, height, options);
+        if (width == outputWidth && height == outputHeight) return fragment;
+        // The static-neighborhood texel fetch needs source coordinates when drawing into a scaled viewport.
+        return substitute(fragment, "ivec2 pixel = ivec2(gl_FragCoord.xy);",
+            "ivec2 pixel = clamp(ivec2(uv * vec2(" + width + ".0, " + height
+                + ".0)), ivec2(0), ivec2(" + (width - 1) + ", " + (height - 1) + "));",
+            "static-neighborhood source texel");
+    }
+
     /** Host/reference name for a shader literal so build receipts can identify exact bytes. */
     static String literal(String name) {
         switch (name) {
@@ -585,7 +598,7 @@ public final class GlesMotionWarp implements WindowBackend {
     private final Thread owner = Thread.currentThread();
     private Thread renderOwner;
     private boolean sharedDraw;
-    private final int frameWidth, frameHeight;
+    private final int frameWidth, frameHeight, outputWidth, outputHeight;
     private final boolean asyncReadback, useAhb, wantsVisibilityGate, wantsNativeStaticGate;
     /** True when the RG8 cell-prior payload and texture are needed (the visibility gate). */
     private final boolean wantsCellPrior;
@@ -621,6 +634,11 @@ public final class GlesMotionWarp implements WindowBackend {
     }
 
     public GlesMotionWarp(int width, int height, boolean asyncReadback, boolean useAhb, int renderOptions) {
+        this(width, height, width, height, asyncReadback, useAhb, renderOptions);
+    }
+
+    GlesMotionWarp(int width, int height, int outputWidth, int outputHeight,
+                   boolean asyncReadback, boolean useAhb, int renderOptions) {
         this.useAhb = useAhb;
         this.asyncReadback = asyncReadback && !useAhb;
         if (renderOptions < 0 || (renderOptions & ~FC_KNOWN) != 0) {
@@ -643,6 +661,9 @@ public final class GlesMotionWarp implements WindowBackend {
         }
         frameWidth = width;
         frameHeight = height;
+        if (outputWidth <= 0 || outputHeight <= 0) throw new IllegalArgumentException("invalid output size");
+        this.outputWidth = outputWidth;
+        this.outputHeight = outputHeight;
         // A FlowSlot allocates the prior planes only when a switch asked for them, so the default
         // path's working set is exactly the pre-existing one. The static plane is requested when
         // the native static gate is on, because the occupancy receipt then reports its cell count.
@@ -651,7 +672,7 @@ public final class GlesMotionWarp implements WindowBackend {
             new FlowSlot(wantsNativeStaticGate, wantsVisibilityGate)};
         try {
             estimator = useAhb ? QcomMotionNative.createAhb() : QcomMotionNative.create();
-            if (estimator == 0) throw new IllegalStateException("Vulkan QCOM block matcher unavailable");
+            if (estimator == 0) throw new Unsupported("Vulkan QCOM block matcher unavailable");
             if (wantsNativeStaticGate) {
                 // The classifier's own defaults, set explicitly so the gate cannot inherit a
                 // caller's earlier thresholds on this estimator handle.
@@ -663,7 +684,7 @@ public final class GlesMotionWarp implements WindowBackend {
             lumaProgram = program(QUAD, LUMA);
             // Options zero compiles the frozen literal verbatim; a switch rewrites only the
             // expression it needs, so "off" cannot drift away from the baseline source.
-            warpProgram = program(WARP_VERT, warpFragment(frameWidth, frameHeight, renderOptions));
+            warpProgram = program(WARP_VERT, warpFragment(frameWidth, frameHeight, outputWidth, outputHeight, renderOptions));
             int[] name = new int[1];
             GLES30.glGenFramebuffers(1, name, 0);
             framebuffer = name[0];
@@ -671,7 +692,7 @@ public final class GlesMotionWarp implements WindowBackend {
                 source.texture = texture(frameWidth, frameHeight, GLES30.GL_RGBA8, GLES30.GL_LINEAR);
                 if (useAhb) {
                     source.ahbSlot = QcomMotionNative.createLumaSlot(estimator, source.slotIndex);
-                    if (source.ahbSlot == 0) throw new IllegalStateException("compact luma AHB preflight failed");
+                    if (source.ahbSlot == 0) throw new Unsupported("compact luma AHB preflight failed");
                 } else if (this.asyncReadback) {
                     source.compactReadback = new CompactLumaReadback(LUMA_W / 4, LUMA_H);
                 }
@@ -911,8 +932,8 @@ public final class GlesMotionWarp implements WindowBackend {
     }
 
     private void drawCurrent(Object frame, int width, int height) {
-        if (width != frameWidth || height != frameHeight) {
-            throw new IllegalArgumentException("expected native " + frameWidth + "x" + frameHeight + " output");
+        if (width != outputWidth || height != outputHeight) {
+            throw new IllegalArgumentException("expected " + outputWidth + "x" + outputHeight + " output");
         }
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0);
         viewport(width, height);

@@ -1,1 +1,2 @@
 -keep class io.github.jichuo1.meguviz.media.MediaNative { *; }
+-keep class io.github.jichuo1.meguviz.media.QcomMotionNative { native <methods>; }
