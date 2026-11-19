@@ -159,9 +159,10 @@ struct QcomMotion {
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     /* Pipelines built from the same module with a reducers subset compiled in:
-     *   pipeline        every reducer compiled out (the default, byte-identical)
+     *   pipeline        every reducer compiled out (byte-identical)
      *   reducePipeline  parallel top-two reduction only (output-preserving)
-     * Selected per estimate() by `adaptiveMode`.  The alternate-hypothesis gate
+     * Both are always created; `adaptiveMode` only selects which one is bound.
+     * The alternate-hypothesis gate
      * (reducer bit 1) is deliberately absent from this module: device quality
      * evidence rejected it (crossing 23.416->23.316, occlusion-13 -0.352 dB) for
      * only ~0.14 ms on real 4K content, so no pipeline enables it and
@@ -179,12 +180,15 @@ struct QcomMotion {
     uint32_t timestampBits = 0;
     float timestampPeriod = 0.0f;
     int subpixel = 1;
-    /* Cost-reducer mode.  0 keeps the default pipeline; 1 enables the parallel
-     * top-two reduction, which is output-preserving (strict total order key
-     * (cost, weight, slot index) reproduces the serial left fold exactly).
+    /* Cost-reducer mode.  1 is the default and binds the parallel top-two
+     * reduction pipeline, which is output-preserving (strict total order key
+     * (cost, weight, slot index) reproduces the serial left fold exactly):
+     * 12 locked 4K export pairs were byte-identical and cost -2.46 ms.
+     * 0 keeps the default pipeline and is the explicit rollback, via
+     * debug.meguviz.qcom.adaptive.mode=0 or qcom_motion_set_adaptive(..., 0, ...).
      * Modes 2 and 3 (alternate-window gate) are rejected by
      * qcom_motion_set_adaptive: the gate lost its quality gate on device. */
-    int adaptiveMode = 0;
+    int adaptiveMode = 1;
     /* Parent-confidence cut in thousandths.  Retained only so the validated
      * call signature still works; unused while the gate is absent. */
     int confidenceGateMilli = 250;
@@ -196,14 +200,17 @@ struct QcomMotion {
      * two endpoint frames at the same coordinate. */
     bool staticGate = false;
     /* How the submit->retire fence is awaited.  0 keeps the historical blocking
-     * vkWaitForFences; 1 spins on vkGetFenceStatus first.  The fence covers only
-     * this handle's own single-frame submission, so the interval is dominated by
-     * wakeup latency, and the two strategies retire on the same fence. */
-    int waitStrategy = QCOM_MOTION_WAIT_BLOCK;
+     * vkWaitForFences; 1 is the default and spins on vkGetFenceStatus first.
+     * The fence covers only this handle's own single-frame submission, so the
+     * interval is dominated by wakeup latency, and the two strategies retire on
+     * the same fence.  Device A/B: proven_late 4.26%->0.63% (z=-10.28);
+     * 420/420 output digests identical. */
+    int waitStrategy = QCOM_MOTION_WAIT_POLL;
     uint64_t waitSpinNs = QCOM_MOTION_WAIT_SPIN_NS_DEFAULT;
-    /* True when the spin budget should follow the previous frame's retire
-     * interval instead of the fixed waitSpinNs.  See awaitRetire(). */
-    bool waitSpinNsAdaptive = false;
+    /* True by default: the spin budget follows the previous frame's retire
+     * interval instead of the fixed waitSpinNs.  See awaitRetire().
+     * debug.meguviz.qcom.wait.strategy=0 restores the blocking wait. */
+    bool waitSpinNsAdaptive = true;
     /* The instant the previous estimate retired, and whether there is one.  Used
      * only for the timing report's caller-turnaround figure. */
     Clock::time_point lastRetired{};
@@ -1040,13 +1047,18 @@ static void applyStaticOverrides(QcomMotion &motion)
     motion.staticGate = gate != 0;
     readProperty("debug.meguviz.qcom.adaptive.mode", motion.adaptiveMode);
     readProperty("debug.meguviz.qcom.adaptive.confidence", motion.confidenceGateMilli);
-    /* Wait policy is a latency-only switch, so it is exposed as one property:
-     *   0 or absent  blocking vkWaitForFences (historical)
+    /* Wait policy is a latency-only switch, so it is exposed as one property.
+     * The estimator ships with the adaptive spin as its default:
+     *   absent       adaptive budget, the shipped default (2)
+     *   0            explicit rollback to blocking vkWaitForFences
      *   1            poll with the fixed default budget, then block
      *   2            poll with the adaptive budget, then block
-     * 2 is what the device A/B picked; 0 keeps an unconfigured handle identical
-     * to the pre-existing library. */
-    int waitMode = 0;
+     * 2 is what the device A/B picked (proven_late 4.26%->0.63%, z=-10.28).
+     * readProperty leaves the target untouched when the property is absent, so
+     * waitMode starts at 2 to keep an unconfigured handle on that default
+     * instead of falling through to the blocking else-branch.  An explicit 0
+     * still selects the blocking wait, which is the rollback switch. */
+    int waitMode = 2;
     readProperty("debug.meguviz.qcom.wait.strategy", waitMode);
     if (waitMode == 2) {
         motion.waitStrategy = QCOM_MOTION_WAIT_POLL;

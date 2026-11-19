@@ -133,14 +133,16 @@ enum {
 int qcom_motion_set_static_thresholds(QcomMotion *motion, int threshold_milli,
                                       int neighbor_milli);
 
-/* Opt-in cost reducer.  Mode 0 is the default and runs a pipeline with the
- * reducer compiled out, so its vectors, confidence, candidates, static mask and
- * visibility are byte-identical to the unreduced estimator.
+/* Opt-in cost reducer.  Mode 1 is the default and selects a second pipeline
+ * built from the same shader module with the parallel top-two reduction
+ * specialization constant set, so its vectors, confidence, candidates, static
+ * mask and visibility are byte-identical to the unreduced estimator.
  *
- * Mode 1 selects a second pipeline built from the same shader module with the
- * parallel top-two reduction specialization constant set.  The reduction replaces
- * the 128-iteration serial fold on one lane with an order-keyed tree fold.  The
- * order key is (cost, weight, slot index), a strict total order, so it reproduces
+ * Mode 0 keeps a pipeline with the reducer compiled out - also byte-identical -
+ * and is the explicit rollback via debug.meguviz.qcom.adaptive.mode=0 or this
+ * setter.  The reduction replaces the 128-iteration serial fold on one lane with
+ * an order-keyed tree fold.  The order key is (cost, weight, slot index), a
+ * strict total order, so it reproduces
  * the serial left fold exactly - vectors, confidence, candidates (all four ranks),
  * static mask and visibility are byte-identical.  Worth ~2.4 ms of nativeEstimate
  * p50 on Adreno 740; 12 locked 4K pairs measured 0 differing pixels.
@@ -174,11 +176,13 @@ void qcom_motion_set_static_gate(QcomMotion *motion, int enabled);
  *
  *   QCOM_MOTION_WAIT_BLOCK  historical blocking vkWaitForFences.  Parks the
  *                           thread, so the retire instant includes a scheduler
- *                           wakeup.  Default: an unconfigured handle behaves
- *                           exactly like the pre-existing library.
+ *                           wakeup.  Selected by
+ *                           debug.meguviz.qcom.wait.strategy=0 (rollback).
  *   QCOM_MOTION_WAIT_POLL   polls vkGetFenceStatus on the calling thread within
  *                           a bounded budget, then falls back to the blocking
- *                           wait.  The fallback means a genuinely late fence
+ *                           wait.  Default: an unconfigured handle spins with
+ *                           the adaptive budget.  The fallback means a genuinely
+ *                           late fence
  *                           still completes instead of timing out; the spin only
  *                           ever replaces a wakeup that would otherwise have
  *                           happened.
@@ -188,9 +192,9 @@ void qcom_motion_set_static_gate(QcomMotion *motion, int enabled);
  * frame's submit->retire interval plus a margin, clamped 2..20 ms.  The device
  * A/B picked the adaptive budget (QCOM_MOTION_WAIT_POLL with spin_ns 0).
  * On Android, debug.meguviz.qcom.wait.strategy selects 0/1/2 (block, fixed,
- * adaptive) at handle creation and debug.meguviz.qcom.wait.stats=1 appends a
- * per-30-estimate window statistic to the app's private files directory; both
- * default to the historical behaviour when unset. */
+ * adaptive; absent = adaptive) at handle creation and
+ * debug.meguviz.qcom.wait.stats=1 appends a
+ * per-30-estimate window statistic to the app's private files directory. */
 enum {
     QCOM_MOTION_WAIT_BLOCK = 0,
     QCOM_MOTION_WAIT_POLL = 1,
