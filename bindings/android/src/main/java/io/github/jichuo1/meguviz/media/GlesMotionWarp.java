@@ -21,6 +21,7 @@ public final class GlesMotionWarp implements WindowBackend {
     private static final int LUMA_W = 480, LUMA_H = 272, GRID_W = 60, GRID_H = 34, TILE = 8;
     private static final int GRID_CELLS = GRID_W * GRID_H;
     private static final int INFERRED = 2;
+    private static final int DEADLINE_REJECTED = -9; // MGC_DEADLINE_REJECTED
 
     /**
      * Opt-in render fixed-cost switches. Zero is the frozen behaviour: {@link #WARP_FRAG} is
@@ -501,7 +502,7 @@ public final class GlesMotionWarp implements WindowBackend {
 
     private static final class SourceSlot {
         RenderSourceFences fences;
-        final ByteBuffer luma = buffer(LUMA_W * LUMA_H);
+        final ByteBuffer luma;
         CompactLumaReadback compactReadback;
         int texture;
         long ahbSlot;
@@ -510,7 +511,10 @@ public final class GlesMotionWarp implements WindowBackend {
         final int slotIndex;
         Source active;
 
-        SourceSlot(int slotIndex) { this.slotIndex = slotIndex; }
+        SourceSlot(int slotIndex, boolean useAhb) {
+            this.slotIndex = slotIndex;
+            luma = useAhb ? null : buffer(LUMA_W * LUMA_H);
+        }
 
         boolean allowAhbWrite() {
             if (unprovenProducer) return false;
@@ -592,7 +596,8 @@ public final class GlesMotionWarp implements WindowBackend {
         }
     }
 
-    private final SourceSlot[] sources = {new SourceSlot(0), new SourceSlot(1), new SourceSlot(2)};
+    private final SourceSlot[] sources;
+    private final int[] captureFramebuffers;
     private final FlowSlot[] flows;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Thread owner = Thread.currentThread();
@@ -611,7 +616,9 @@ public final class GlesMotionWarp implements WindowBackend {
     private Future<Boolean> retirementCheck;
     private boolean closingAhb;
     private int copyProgram, originalProgram, lumaProgram, warpProgram;
-    private int framebuffer, lumaTexture, flowTexture, confidenceTexture, candidateTexture;
+    private final int sourceTransformLocation;
+    private boolean warpSamplersInitialized;
+    private int lumaTexture, flowTexture, confidenceTexture, candidateTexture;
     private int cellPriorTexture;
     /** Retained only for the census and prior-occupancy receipts; holds no ownership. */
     private Motion lastDrawn;
@@ -664,6 +671,10 @@ public final class GlesMotionWarp implements WindowBackend {
         if (outputWidth <= 0 || outputHeight <= 0) throw new IllegalArgumentException("invalid output size");
         this.outputWidth = outputWidth;
         this.outputHeight = outputHeight;
+        sources = new SourceSlot[]{new SourceSlot(0, useAhb), new SourceSlot(1, useAhb), new SourceSlot(2, useAhb)};
+        // Each source has a full-size attachment. AHB has one compact attachment per
+        // source, while the two CPU readback modes use the same compact attachment.
+        captureFramebuffers = new int[sources.length + (useAhb ? sources.length : 1)];
         // A FlowSlot allocates the prior planes only when a switch asked for them, so the default
         // path's working set is exactly the pre-existing one. The static plane is requested when
         // the native static gate is on, because the occupancy receipt then reports its cell count.
@@ -680,33 +691,35 @@ public final class GlesMotionWarp implements WindowBackend {
                 QcomMotionNative.setStaticGate(estimator, true);
             }
             copyProgram = program(QUAD, COPY);
+            sourceTransformLocation = GLES30.glGetUniformLocation(copyProgram, "sourceTransform");
             originalProgram = program(QUAD, ORIGINAL);
             lumaProgram = program(QUAD, LUMA);
             // Options zero compiles the frozen literal verbatim; a switch rewrites only the
             // expression it needs, so "off" cannot drift away from the baseline source.
             warpProgram = program(WARP_VERT, warpFragment(frameWidth, frameHeight, outputWidth, outputHeight, renderOptions));
-            int[] name = new int[1];
-            GLES30.glGenFramebuffers(1, name, 0);
-            framebuffer = name[0];
+            GLES30.glGenFramebuffers(captureFramebuffers.length, captureFramebuffers, 0);
             for (SourceSlot source : sources) {
                 source.texture = texture(frameWidth, frameHeight, GLES30.GL_RGBA8, GLES30.GL_LINEAR);
+                attachCaptureTarget(captureFramebuffers[source.slotIndex], source.texture);
                 if (useAhb) {
                     source.ahbSlot = QcomMotionNative.createLumaSlot(estimator, source.slotIndex);
                     if (source.ahbSlot == 0) throw new Unsupported("compact luma AHB preflight failed");
+                    int compactTarget = QcomMotionNative.lumaTexture(source.ahbSlot);
+                    attachCaptureTarget(compactFramebuffer(source), compactTarget);
                 } else if (this.asyncReadback) {
                     source.compactReadback = new CompactLumaReadback(LUMA_W / 4, LUMA_H);
                 }
             }
             // Pack four consecutive luma samples into RGBA8 so the guaranteed
             // GL_RGBA/GL_UNSIGNED_BYTE readback is already the exact R8 byte layout.
-            if (!useAhb) lumaTexture = texture(LUMA_W / 4, LUMA_H, GLES30.GL_RGBA8, GLES30.GL_NEAREST);
+            if (!useAhb) {
+                lumaTexture = texture(LUMA_W / 4, LUMA_H, GLES30.GL_RGBA8, GLES30.GL_NEAREST);
+                attachCaptureTarget(captureFramebuffers[sources.length], lumaTexture);
+            }
             flowTexture = texture(GRID_W, GRID_H, GLES30.GL_RGBA16F, GLES30.GL_NEAREST);
             confidenceTexture = texture(GRID_W, GRID_H, GLES30.GL_RG8, GLES30.GL_NEAREST);
             candidateTexture = texture(GRID_W, QcomCandidateField.ROWS, GLES30.GL_RGBA16F, GLES30.GL_NEAREST);
             if (wantsCellPrior) cellPriorTexture = texture(GRID_W, GRID_H, GLES30.GL_RG8, GLES30.GL_NEAREST);
-            int lumaTarget = useAhb ? QcomMotionNative.lumaTexture(sources[0].ahbSlot) : lumaTexture;
-            if (lumaTarget == 0) throw new IllegalStateException("invalid luma attachment");
-            bindTarget(lumaTarget, LUMA_W / 4, LUMA_H);
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0);
             checkGl("warp setup");
         } catch (RuntimeException | Error failure) {
@@ -766,21 +779,23 @@ public final class GlesMotionWarp implements WindowBackend {
             if (sharedDraw && !slot.fences.retireForReuse()) continue;
             if (useAhb && !slot.allowAhbWrite()) continue;
             if (useAhb) {
+                // The native slot verifies the current EGL owner before either draw.
+                if (QcomMotionNative.lumaTexture(slot.ahbSlot) == 0)
+                    throw new IllegalStateException("lost compact luma attachment");
                 ahbGlUsed = true;
                 slot.unprovenProducer = true;
             }
             try {
-                bindTarget(slot.texture, frameWidth, frameHeight);
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, captureFramebuffers[slot.slotIndex]);
+                viewport(frameWidth, frameHeight);
                 GLES30.glUseProgram(copyProgram);
-                bindSampler(copyProgram, "sourceImage", 0, GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oes);
-                GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(copyProgram, "sourceTransform"),
-                    1, false, transform, 0);
+                bindTexture(0, GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oes);
+                GLES30.glUniformMatrix4fv(sourceTransformLocation, 1, false, transform, 0);
                 quad();
-                int compactTarget = useAhb ? QcomMotionNative.lumaTexture(slot.ahbSlot) : lumaTexture;
-                if (compactTarget == 0) throw new IllegalStateException("lost compact luma attachment");
-                bindTarget(compactTarget, LUMA_W / 4, LUMA_H);
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, compactFramebuffer(slot));
+                GLES30.glViewport(0, 0, LUMA_W / 4, LUMA_H);
                 GLES30.glUseProgram(lumaProgram);
-                bindSampler(lumaProgram, "sourceImage", 0, GLES30.GL_TEXTURE_2D, slot.texture);
+                bindTexture(0, GLES30.GL_TEXTURE_2D, slot.texture);
                 quad();
                 Source captured = new Source(slot, sourceId, ptsUs);
                 if (useAhb) {
@@ -835,8 +850,11 @@ public final class GlesMotionWarp implements WindowBackend {
                 pending = worker.submit(() -> {
                     long started = System.nanoTime();
                     try {
+                        if (started >= deadlineNs) {
+                            motion.status = DEADLINE_REJECTED;
+                            return motion;
+                        }
                         // The estimate itself only touches compact buffers and its Vulkan queue.
-                        long estimateStarted = System.nanoTime();
                         if (useAhb) {
                             // The two Source references held by Motion keep these exact generations
                             // and their original descriptors alive until positive Vulkan retirement.
@@ -867,7 +885,12 @@ public final class GlesMotionWarp implements WindowBackend {
                                     first.slot.luma, second.slot.luma, flow.raw, null, flow.nativeCandidates);
                             }
                         }
-                        motion.nativeEstimateNs = System.nanoTime() - estimateStarted;
+                        long estimated = System.nanoTime();
+                        motion.nativeEstimateNs = estimated - started;
+                        if (motion.status == 0 && !motion.ahbPending && estimated >= deadlineNs) {
+                            motion.status = DEADLINE_REJECTED;
+                            return motion;
+                        }
                         if (motion.status == 0) {
                             prepareMidpoint(flow);
                             long projectionStarted = System.nanoTime();
@@ -939,30 +962,31 @@ public final class GlesMotionWarp implements WindowBackend {
         viewport(width, height);
         if (frame instanceof Source) {
             GLES30.glUseProgram(originalProgram);
-            bindSampler(originalProgram, "sourceImage", 0, GLES30.GL_TEXTURE_2D, ((Source) frame).slot.texture);
+            bindTexture(0, GLES30.GL_TEXTURE_2D, ((Source) frame).slot.texture);
             quad();
         } else {
             Motion motion = (Motion) frame;
             lastDrawn = motion;
             GLES30.glUseProgram(warpProgram);
-            bindSampler(warpProgram, "previousImage", 0, GLES30.GL_TEXTURE_2D, motion.left.slot.texture);
-            bindSampler(warpProgram, "currentImage", 1, GLES30.GL_TEXTURE_2D, motion.right.slot.texture);
-            bindSampler(warpProgram, "motionField", 2, GLES30.GL_TEXTURE_2D, flowTexture);
+            if (!warpSamplersInitialized) initializeWarpSamplers();
+            bindTexture(0, GLES30.GL_TEXTURE_2D, motion.left.slot.texture);
+            bindTexture(1, GLES30.GL_TEXTURE_2D, motion.right.slot.texture);
+            bindTexture(2, GLES30.GL_TEXTURE_2D, flowTexture);
             motion.flow.positions.clear();
             GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GLES30.GL_RGBA,
                 GLES30.GL_FLOAT, motion.flow.positions);
-            bindSampler(warpProgram, "confidenceField", 3, GLES30.GL_TEXTURE_2D, confidenceTexture);
+            bindTexture(3, GLES30.GL_TEXTURE_2D, confidenceTexture);
             motion.flow.confidence.clear();
             GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GLES30.GL_RG,
                 GLES30.GL_UNSIGNED_BYTE, motion.flow.confidence);
-            bindSampler(warpProgram, "candidateField", 4, GLES30.GL_TEXTURE_2D, candidateTexture);
+            bindTexture(4, GLES30.GL_TEXTURE_2D, candidateTexture);
             motion.flow.midpointCandidates.clear();
             GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, GRID_W, QcomCandidateField.ROWS,
                 GLES30.GL_RGBA, GLES30.GL_FLOAT, motion.flow.midpointCandidates);
             if (cellPriorTexture != 0) {
                 // glTexSubImage2D writes to the texture bound on the active unit, so each upload
                 // binds its target first; the same binding serves the draw that follows.
-                bindSampler(warpProgram, "cellPrior", 5, GLES30.GL_TEXTURE_2D, cellPriorTexture);
+                bindTexture(5, GLES30.GL_TEXTURE_2D, cellPriorTexture);
                 motion.flow.cellPrior.clear();
                 GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H,
                     GLES30.GL_RG, GLES30.GL_UNSIGNED_BYTE, motion.flow.cellPrior);
@@ -1031,8 +1055,8 @@ public final class GlesMotionWarp implements WindowBackend {
         }
         int[] textures = {sources[0].texture, sources[1].texture, sources[2].texture,
             lumaTexture, flowTexture, confidenceTexture, candidateTexture, cellPriorTexture};
+        GLES30.glDeleteFramebuffers(captureFramebuffers.length, captureFramebuffers, 0);
         GLES30.glDeleteTextures(textures.length, textures, 0);
-        GLES30.glDeleteFramebuffers(1, new int[]{framebuffer}, 0);
         for (int handle : new int[]{copyProgram, originalProgram, lumaProgram, warpProgram}) {
             if (handle != 0) GLES30.glDeleteProgram(handle);
         }
@@ -1261,14 +1285,18 @@ public final class GlesMotionWarp implements WindowBackend {
         return r * GRID_W + c;
     }
 
-    private void bindTarget(int image, int width, int height) {
+    private int compactFramebuffer(SourceSlot source) {
+        return captureFramebuffers[sources.length + (useAhb ? source.slotIndex : 0)];
+    }
+
+    private static void attachCaptureTarget(int framebuffer, int image) {
+        if (framebuffer == 0 || image == 0) throw new IllegalStateException("missing capture target");
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, framebuffer);
         GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
             GLES30.GL_TEXTURE_2D, image, 0);
         if (GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) != GLES30.GL_FRAMEBUFFER_COMPLETE) {
             throw new IllegalStateException("incomplete capture target");
         }
-        viewport(width, height);
     }
 
     private static void viewport(int width, int height) {
@@ -1290,10 +1318,21 @@ public final class GlesMotionWarp implements WindowBackend {
         return ids[0];
     }
 
-    private static void bindSampler(int program, String uniform, int unit, int target, int texture) {
+    private void initializeWarpSamplers() {
+        // Uniforms default to zero after link and survive draws. The copy,
+        // original, luma and previousImage samplers all use texture unit zero.
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "currentImage"), 1);
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "motionField"), 2);
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "confidenceField"), 3);
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "candidateField"), 4);
+        if (wantsCellPrior) GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "cellPrior"), 5);
+        checkGl("warp samplers");
+        warpSamplersInitialized = true;
+    }
+
+    private static void bindTexture(int unit, int target, int texture) {
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + unit);
         GLES30.glBindTexture(target, texture);
-        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, uniform), unit);
     }
 
     private static void quad() { GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4); }
