@@ -19,7 +19,7 @@ Android 源码构建先生成 `:media-api:assembleRelease`，以生成的 API AA
 将安装目录加入 `CMAKE_PREFIX_PATH` 后链接核心库：
 
 ```cmake
-find_package(MeguvizMedia 1.2.1 CONFIG REQUIRED)
+find_package(MeguvizMedia 1.2.2 CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE MeguvizMedia::core)
 ```
 

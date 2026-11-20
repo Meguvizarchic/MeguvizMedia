@@ -6,7 +6,7 @@ android {
         applicationId = "io.github.jichuo1.meguviz.media.sample"
         minSdk = 27
         targetSdk = 37
-        versionCode = 10201
+        versionCode = 10202
         versionName = "${project.version}-reference"
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }

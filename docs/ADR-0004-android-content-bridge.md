@@ -24,6 +24,8 @@ python tools/build_android_composition.py --abi all --jvm-api android/media-api/
 android/gradlew.bat -p android -Pmeguviz.compositionDir=../artifacts/M6/android-composition :media-rife-jni:assembleRelease :sample-player:assembleDebug
 ```
 
+默认构建 `full` 算子配置，并在 Android API 23 及以上启用 APS2 重定位压缩。传入 `--ncnn-layer-profile rife46-arm64` 可在 ARM64 上启用锁定的 RIFE 4.6 算子配置，ARMv7 继续使用全量。`--ncnn-layer-profile rife46` 用于在两种 ABI 上验证裁层。进行重定位对照时，传入 `--packed-relocations off`。构建记录包含每种 ABI 实际使用的配置、算子清单和生成注册表的指纹。外部着色器包需要使用对应构建的私有 SDK 指纹。
+
 受控回退：应用停止新任务、取消/提升 epoch、继续 poll 直到 accepted 工作退役、释放 owned frames 与 GL 读取，close 成功后恢复宿主 OES/旧 ByteBuffer 路径。TIMEOUT/BUSY 时保留对象，不能强行释放 GPU 正在读取的资源。
 
 ## RIFE 与 QCOM 的统一 Android 入口

@@ -11,7 +11,7 @@ description: 在 C/C++ 或 Android 消费方接入 MeguvizMedia 时间线、iden
 
 | 需求 | 接入点 |
 | --- | --- |
-| C/C++ 时间线、帧调度或 identity | `find_package(MeguvizMedia 1.2.1 CONFIG REQUIRED)` 并链接 `MeguvizMedia::core`。参照 `examples/external_consumer`，从 `include/meguviz/media.h` 与实际用到的时间线或 cadence 头开始。 |
+| C/C++ 时间线、帧调度或 identity | `find_package(MeguvizMedia 1.2.2 CONFIG REQUIRED)` 并链接 `MeguvizMedia::core`。参照 `examples/external_consumer`，从 `include/meguviz/media.h` 与实际用到的时间线或 cadence 头开始。 |
 | Android identity | 使用已包含 Java API 的 `media-jni` AAR，调用 `MediaRuntime.loadPackagedIdentity()`。identity 可验证帧传递。 |
 | Android 播放器补帧 | 普通应用使用已包含 Java API 的 `media-rife-jni` AAR，经 `MediaRuntime.loadPackaged()` 加载。已有按需 loader 时选择同批 API-only 和 native payload，再用 `MediaRuntime.loadValidatedAbsolutePath()` 或 `attachAlreadyLoaded()`。每种消费者只选一种装配方式。 |
 

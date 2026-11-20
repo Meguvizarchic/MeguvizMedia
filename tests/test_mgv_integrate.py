@@ -83,6 +83,45 @@ def fixture(name):
 
 
 class InspectTests(unittest.TestCase):
+    def test_arm64_only_layers_require_each_abis_effective_profile(self):
+        root, path, manifest, _, _ = fixture("arm64-only-layers")
+        lock = json.loads((root / "composition-lock.json").read_bytes())
+        profiles = {"ncnn_layer_profile": "rife46-arm64", "android_packed_relocations": "ON"}
+        lock["toolchain"] = profiles
+        lock_bytes = json.dumps(lock).encode()
+        (root / "composition-lock.json").write_bytes(lock_bytes)
+        manifest["composition_lock"].update(sha256=digest(lock_bytes), size_bytes=len(lock_bytes))
+        for item in manifest["abis"]:
+            item.update(profiles, ncnn_effective_layer_profile="rife46" if item["abi"] == "arm64-v8a" else "full")
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(inspector.inspect(path)["result"], "PASS")
+        v7 = next(item for item in manifest["abis"] if item["abi"] == "armeabi-v7a")
+        v7["ncnn_effective_layer_profile"] = "rife46"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ncnn_effective_layer_profile"):
+            inspector.inspect(path)
+        del v7["ncnn_effective_layer_profile"]
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ncnn_effective_layer_profile"):
+            inspector.inspect(path)
+
+    def test_size_profiles_follow_the_toolchain_lock(self):
+        root, path, manifest, _, _ = fixture("native-size-profiles")
+        lock = json.loads((root / "composition-lock.json").read_bytes())
+        profiles = {"ncnn_layer_profile": "rife46", "android_packed_relocations": "ON"}
+        lock["toolchain"] = profiles
+        lock_bytes = json.dumps(lock).encode()
+        (root / "composition-lock.json").write_bytes(lock_bytes)
+        manifest["composition_lock"].update(sha256=digest(lock_bytes), size_bytes=len(lock_bytes))
+        for item in manifest["abis"]:
+            item.update(profiles)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(inspector.inspect(path)["result"], "PASS")
+        manifest["abis"][1]["ncnn_layer_profile"] = "full"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ncnn_layer_profile"):
+            inspector.inspect(path)
+
     def test_declared_shared_plan_profile_matches_both_abis(self):
         root, path, manifest, _, _ = fixture("shared-plan-mismatch")
         lock = json.loads((root / "composition-lock.json").read_bytes())
@@ -286,6 +325,24 @@ class InspectTests(unittest.TestCase):
 
 
 class SourceLockTests(unittest.TestCase):
+    def test_size_options_are_explicit_for_new_and_legacy_locks(self):
+        builder = ROOT / "MeguvizMedia/tools/build_android_composition.py"
+        new = {"ncnn_layer_profile": "rife46", "android_packed_relocations": "ON"}
+        self.assertEqual(inspector.composition_size_arguments(builder, new),
+                         ["--ncnn-layer-profile", "rife46", "--packed-relocations", "on"])
+        new["ncnn_layer_profile"] = "rife46-arm64"
+        self.assertEqual(inspector.composition_size_arguments(builder, new),
+                         ["--ncnn-layer-profile", "rife46-arm64", "--packed-relocations", "on"])
+        with patch.object(inspector.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = b"--ncnn-layer-profile {full,rife46} --packed-relocations {on,off}"
+            self.assertEqual(inspector.composition_size_arguments(builder, {}),
+                             ["--ncnn-layer-profile", "full", "--packed-relocations", "off"])
+            run.return_value.stdout = b"--shared-plan {on,off}"
+            self.assertEqual(inspector.composition_size_arguments(builder, {}), [])
+        with self.assertRaisesRegex(ValueError, "unsupported ncnn layer or relocation profile"):
+            inspector.composition_size_arguments(builder, {"ncnn_layer_profile": "unknown"})
+
     def test_exact_snapshot_and_changed_or_tampered_source(self):
         root = BASE / "source-lock"
         root.mkdir()

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31)
-project(MeguvizMedia VERSION 1.2.1 LANGUAGES C CXX)
+project(MeguvizMedia VERSION 1.2.2 LANGUAGES C CXX)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 set(CMAKE_CXX_STANDARD 17)

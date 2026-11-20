@@ -58,6 +58,46 @@ def canonical_hash(value):
     return sha(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
+def composition_size_profiles(toolchain):
+    if not isinstance(toolchain, dict):
+        raise ValueError("invalid composition toolchain")
+    layers = toolchain.get("ncnn_layer_profile", "full")
+    relocations = toolchain.get("android_packed_relocations", "OFF")
+    if layers not in ("full", "rife46", "rife46-arm64") or relocations not in ("ON", "OFF"):
+        raise ValueError("unsupported ncnn layer or relocation profile in the composition lock")
+    return {"ncnn_layer_profile": layers, "android_packed_relocations": relocations}
+
+
+def require_composition_size_profiles(toolchain, record, abi=None):
+    profiles = composition_size_profiles(toolchain)
+    for name, value in profiles.items():
+        if (name in toolchain or name in record) and record.get(name) != value:
+            raise ValueError("ABI composition profile differs from the lock: " + name)
+    if abi is not None:
+        expected = profiles["ncnn_layer_profile"]
+        mixed = expected == "rife46-arm64"
+        if mixed:
+            expected = "rife46" if abi == "arm64-v8a" else "full"
+        if mixed or "ncnn_effective_layer_profile" in record:
+            if record.get("ncnn_effective_layer_profile") != expected:
+                raise ValueError("ABI composition profile differs from the lock: ncnn_effective_layer_profile")
+
+
+def composition_size_arguments(builder, toolchain):
+    profiles = composition_size_profiles(toolchain)
+    if not any(name in toolchain for name in profiles):
+        # Legacy locks predating both options bind full layers and plain
+        # relocations. Older locked builders already used those defaults.
+        help_result = subprocess.run([sys.executable, "-B", str(builder), "--help"],
+            cwd=builder.parent.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if help_result.returncode:
+            raise ValueError("could not determine the locked composition builder options")
+        if b"--ncnn-layer-profile" not in help_result.stdout and b"--packed-relocations" not in help_result.stdout:
+            return []
+    return ["--ncnn-layer-profile", profiles["ncnn_layer_profile"],
+            "--packed-relocations", profiles["android_packed_relocations"].lower()]
+
+
 def git_output(directory, *arguments):
     command = ["git", "-c", "safe.directory=" + str(directory), "-C", str(directory), *arguments]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -120,6 +160,7 @@ def verify_development_lock(lock_path, source_root):
         raise ValueError("shader inputs differ from development lock")
     if lock.get("runtime_compiler_retained") is not True or not isinstance(lock.get("toolchain"), dict):
         raise ValueError("development build configuration is incomplete")
+    composition_size_profiles(lock["toolchain"])
     return {"schema_version": 1, "result": "PASS", "scope": "DEVELOPMENT_PROJECT_SOURCE_LOCK_ONLY",
             "lock": {"path": str(lock_path), "sha256": sha(lock_data)}, "source_root": str(source_root),
             "projects": summary, "shader_inputs_checked": len(shader_inputs),
@@ -212,7 +253,9 @@ def inspect(manifest_path, bil_apk=None):
     if (not isinstance(lock, dict) or not check_hash(manifest.get("shaderpack_fingerprint"))
             or lock.get("shaderpack_fingerprint") != manifest.get("shaderpack_fingerprint")):
         raise ValueError("composition lock shader fingerprint mismatch")
-    observation = lock.get("toolchain", {}).get("job_observation", "OFF")
+    toolchain = lock.get("toolchain", {})
+    composition_size_profiles(toolchain)
+    observation = toolchain.get("job_observation", "OFF")
     if observation not in ("ON", "OFF"):
         raise ValueError("invalid job observation build profile")
     shared_plan = lock.get("toolchain", {}).get("shared_plan")
@@ -231,6 +274,7 @@ def inspect(manifest_path, bil_apk=None):
         raise ValueError("both distinct Android ABIs are required")
     expected = {}
     for item in abis:
+        require_composition_size_profiles(toolchain, item, item["abi"])
         if not check_hash(item.get("private_sdk_fingerprint")):
             raise ValueError("private SDK fingerprint missing")
         if item.get("job_observation", "OFF") != observation:
@@ -368,6 +412,8 @@ def build_candidate(lock_path, source_root, api_path, api_sha256, output_path, o
     shared_plan = tc.get("shared_plan", "ON")
     if shared_plan not in ("ON", "OFF"):
         raise ValueError("unsupported shared plan profile in the development lock")
+    builder = source_root / "MeguvizMedia/tools/build_android_composition.py"
+    size_arguments = composition_size_arguments(builder, tc)
     ndk = Path(tc.get("ndk", "")).resolve(strict=True)
     cmake = Path(tc.get("cmake", "")).resolve(strict=True)
     ninja = cmake.parent / ("ninja.exe" if sys.platform == "win32" else "ninja")
@@ -396,11 +442,11 @@ def build_candidate(lock_path, source_root, api_path, api_sha256, output_path, o
     def save():
         record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     save()
-    command = [sys.executable, "-B", str(source_root / "MeguvizMedia/tools/build_android_composition.py"),
+    command = [sys.executable, "-B", str(builder),
         "--abi", "all", "--ndk", str(ndk), "--cmake", str(cmake), "--ninja", str(ninja),
         "--jvm-api", str(api_path), "--openmp", openmp, "--job-observation", job_observation,
         "--shared-plan", shared_plan.lower(), "--output-dir", str(output_path / "composition"),
-        "--build-root", str(output_path / "build")]
+        "--build-root", str(output_path / "build"), *size_arguments]
     record["argv"] = command
     save()
     try:
@@ -431,6 +477,12 @@ def build_candidate(lock_path, source_root, api_path, api_sha256, output_path, o
             raise ValueError("produced source lock differs from input source lock")
         if produced_lock.get("toolchain", {}).get("shared_plan") != shared_plan:
             raise ValueError("produced shared plan profile differs from the development lock")
+        expected_size_profiles = dict(tc)
+        if size_arguments:
+            expected_size_profiles.update(composition_size_profiles(tc))
+        require_composition_size_profiles(expected_size_profiles, produced_lock.get("toolchain", {}))
+        for item in manifest["abis"]:
+            require_composition_size_profiles(expected_size_profiles, item, item["abi"])
         if sha(material(composition, manifest["jvm_api"])) != api_sha256:
             raise ValueError("produced API AAR differs from locked input")
         payload = output_path / "native-payload.zip"

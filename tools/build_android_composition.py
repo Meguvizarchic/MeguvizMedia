@@ -27,6 +27,10 @@ PARSER.add_argument("--build-root", type=Path, help="separate directory for per-
 PARSER.add_argument("--openmp", choices=["on", "off"], default="on", help="Android composition runtime profile; off retains the fallback")
 PARSER.add_argument("--job-observation", choices=["on", "off"], default="off", help="Optional result-owned execution observations")
 PARSER.add_argument("--shared-plan", choices=["on", "off"], default="on", help="Compile the optional shared GPU plan protocol")
+PARSER.add_argument("--ncnn-layer-profile", choices=["full", "rife46", "rife46-arm64"], default="full",
+                    help="Build the full registry or use the locked RIFE 4.6 layers on all requested ABIs or on ARM64 only")
+PARSER.add_argument("--packed-relocations", choices=["on", "off"], default="on",
+                    help="Use Android APS2 dynamic relocations (Android API 23+)")
 ARGS = PARSER.parse_args()
 OUT = (ARGS.output_dir or ROOT / "artifacts/M6/android-composition").resolve()
 BUILD_ROOT = (ARGS.build_root or ROOT / "build").resolve()
@@ -80,6 +84,8 @@ for abi in abis:
         "-DCMAKE_BUILD_TYPE=Release", "-DMGM_ANDROID_COMPOSITION=ON", "-DMGC_WITH_NCNN=ON",
         "-DMGM_ANDROID_STATIC_OPENMP=" + ARGS.openmp.upper(),
         "-DMGM_ANDROID_SHARED_PLAN=" + ARGS.shared_plan.upper(),
+        "-DMGM_ANDROID_NCNN_LAYER_PROFILE=" + ARGS.ncnn_layer_profile,
+        "-DMGM_ANDROID_PACKED_RELOCATIONS=" + ARGS.packed_relocations.upper(),
         "-DMGR_ENABLE_JOB_OBSERVATION=" + ARGS.job_observation.upper(),
         "-DMGC_VULKAN=ON",
         "-DMGC_NCNN_SOURCE=" + str(PACK / "dependencies/ncnn-meguviz"),
@@ -98,9 +104,28 @@ for abi in abis:
     payload.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(build / "libmeguviz_media_rife_ncnn.so", payload)
     run(abi + "-canonical-strip", [strip, "--strip-unneeded", payload])
-    run(abi + "-elf", [readelf, "-lWd", payload])
+    elf = run(abi + "-elf", [readelf, "-lWd", payload])
     build_info = json.loads((build / "compute/build-info.json").read_text())
     rife_info = json.loads((build / "rife/build-info.json").read_text())
+    composition = json.loads((build / "composition-options.json").read_text())
+    effective_layer_profile = ARGS.ncnn_layer_profile
+    if effective_layer_profile == "rife46-arm64":
+        effective_layer_profile = "rife46" if abi == "arm64-v8a" else "full"
+    if composition != {"ncnn_layer_profile": ARGS.ncnn_layer_profile,
+                       "ncnn_effective_layer_profile": effective_layer_profile,
+                       "android_packed_relocations": ARGS.packed_relocations.upper()}:
+        raise RuntimeError("Actual ncnn layer or relocation profile differs from the requested composition")
+    expected_manifest = (sha(PACK / "MeguvizRIFE/models/catalog/rife46.ncnn-layers.json")
+                         if effective_layer_profile == "rife46" else "none")
+    if build_info["ncnn_layer_manifest_sha256"] != expected_manifest:
+        raise RuntimeError("Compute layer manifest does not match the effective ncnn layer profile")
+    has_aps2 = b"(ANDROID_REL)" in elf or b"(ANDROID_RELA)" in elf
+    if has_aps2 != (ARGS.packed_relocations == "on"):
+        raise RuntimeError("Canonical payload has an unexpected Android relocation format")
+    if (hashlib.sha256(build_info["build_options"].encode("utf-8")).hexdigest()
+            != build_info["build_options_sha256"]
+            or build_info["build_options_sha256"] != build_info["private_sdk_fingerprint"]):
+        raise RuntimeError("Compute build options do not match the private SDK fingerprint")
     if build_info.get("android_static_openmp") != ARGS.openmp.upper():
         raise RuntimeError("Actual OpenMP profile differs from the requested composition")
     if rife_info.get("job_observation") != ARGS.job_observation.upper():
@@ -110,6 +135,12 @@ for abi in abis:
     build_infos[abi] = build_info
     receipt = dict(abi=abi, path=str(payload.relative_to(OUT)).replace("\\", "/"),
         sha256=sha(payload), size_bytes=payload.stat().st_size,
+        **composition,
+        build_options_sha256=build_info["build_options_sha256"],
+        ncnn_layer_manifest_sha256=build_info["ncnn_layer_manifest_sha256"],
+        ncnn_layer_state_sha256=build_info["ncnn_layer_state_sha256"],
+        ncnn_layer_registry_sha256=build_info["ncnn_layer_registry_sha256"],
+        ncnn_shader_registry_sha256=build_info["ncnn_shader_registry_sha256"],
         private_sdk_fingerprint=build_info["private_sdk_fingerprint"],
         rife_build_fingerprint=rife_info["build_fingerprint"], job_observation=rife_info["job_observation"],
         shared_plan=rife_info["shared_plan"],
@@ -147,6 +178,8 @@ if not ARGS.objects_only and ARGS.jvm_api:
     lock.write_text(json.dumps(dict(schema_version=1, sources=sources, shader_inputs=shader_inputs,
         shaderpack_fingerprint=fingerprint, runtime_compiler_retained=True,
         toolchain=dict(ndk=str(ARGS.ndk), cmake=str(ARGS.cmake), stl="c++_static", api=27,
+                       ncnn_layer_profile=ARGS.ncnn_layer_profile,
+                       android_packed_relocations=ARGS.packed_relocations.upper(),
                        android_static_openmp=ARGS.openmp.upper(),
                        job_observation=ARGS.job_observation.upper(),
                        shared_plan=ARGS.shared_plan.upper(),
