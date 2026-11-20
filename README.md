@@ -22,6 +22,8 @@ C ABI · identity / RIFE · Android AHB 管线
 
 `src/core` 不依赖 RIFE、Android 或 bil。可选 `MeguvizMedia::rife_integration` 只消费 RIFE 公共 API；`MeguvizMedia::android` 消费 Compute 的 AHB/layout/FOREIGN/fence 合同。HostBridge 接口把播放器时钟、宿主恢复、音频和反射留给宿主，通用 SDK 不含 bil hook。
 
+在 Codex 中打开本仓库后，输入 `$meguviz-media` 并指定宿主或处理模块，可接入时间线、帧调度，或迁移到统一帧生成会话。[接入与迁移技能](.agents/skills/meguviz-media/SKILL.md) · [与 MeguvizMemory 共用 CPU 帧](docs/MEMORY_INTEROP.md)
+
 已运行验证：
 
 - C ABI 边界：先读取 8 字节首部，再复制调用方声明的前缀；旧描述符可省略尾部保留字段，短于最小前缀、未知必需 flag/major 与非零保留字段明确拒绝。真实页边界回归覆盖输入和输出，详见 `artifacts/M1/descriptor-compatibility/summary.json`。
