@@ -18,7 +18,7 @@ C ABI · identity / RIFE · Android AHB 管线
 
 ---
 
-当前提供 C++17 帧/时间线 core、公开 C ABI、identity/RIFE effect、独立调度准入，以及 Android OES→自有全分辨率 RGBA8 AHB→Compute/RIFE→AHB→GLES 的功能候选。Android 组合以 `libmeguviz_media_rife_ncnn.so` 作为目标 native owner，双 ABI 都保留原 Vulkan NN 的 ByteBuffer 兼容路径。真实 GPU、图像等价、显示与 A/V 资格尚未通过，详见 `STATUS.json`。
+当前版本为 `1.2.1`，提供 C++17 帧/时间线 core、公开 C ABI、identity/RIFE effect、独立调度准入，以及 Android OES→自有全分辨率 RGBA8 AHB→Compute/RIFE→AHB→GLES 的功能候选。Android 组合以 `libmeguviz_media_rife_ncnn.so` 作为目标 native owner，双 ABI 都保留原 Vulkan NN 的 ByteBuffer 兼容路径。真实 GPU、图像等价、显示与 A/V 资格尚未通过，详见 `STATUS.json`。
 
 `src/core` 不依赖 RIFE、Android 或 bil。可选 `MeguvizMedia::rife_integration` 只消费 RIFE 公共 API；`MeguvizMedia::android` 消费 Compute 的 AHB/layout/FOREIGN/fence 合同。HostBridge 接口把播放器时钟、宿主恢复、音频和反射留给宿主，通用 SDK 不含 bil hook。
 

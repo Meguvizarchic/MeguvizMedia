@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31)
-project(MeguvizMedia VERSION 0.1.0 LANGUAGES C CXX)
+project(MeguvizMedia VERSION 1.2.1 LANGUAGES C CXX)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 set(CMAKE_CXX_STANDARD 17)
@@ -102,8 +102,16 @@ if(MGM_BUILD_TESTS)
   if(MGM_WITH_RIFE)
     add_executable(mgm_rife_adapter_test tests/rife_adapter.cpp)
     target_link_libraries(mgm_rife_adapter_test PRIVATE MeguvizMedia::rife_integration)
+    # Run the real adapter against controlled ticket completion ordering.
+    add_executable(mgm_rife_adapter_ticket_test tests/rife_adapter_ticket.cpp integrations/rife/adapter.cpp)
+    target_include_directories(mgm_rife_adapter_ticket_test PRIVATE include src
+      $<TARGET_PROPERTY:MeguvizCompute::core,INTERFACE_INCLUDE_DIRECTORIES>
+      $<TARGET_PROPERTY:MeguvizRIFE::core,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(mgm_rife_adapter_ticket_test PRIVATE Threads::Threads)
+    add_test(NAME rife_adapter_ticket_order COMMAND mgm_rife_adapter_ticket_test)
     if(MGR_ENABLE_JOB_OBSERVATION)
       target_compile_definitions(mgm_rife_adapter_test PRIVATE MGR_ENABLE_JOB_OBSERVATION=1)
+      target_compile_definitions(mgm_rife_adapter_ticket_test PRIVATE MGR_ENABLE_JOB_OBSERVATION=1)
     endif()
   endif()
 endif()

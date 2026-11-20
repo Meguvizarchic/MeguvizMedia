@@ -11,7 +11,7 @@ description: 在 C/C++ 或 Android 消费方接入 MeguvizMedia 时间线、iden
 
 | 需求 | 接入点 |
 | --- | --- |
-| C/C++ 时间线、帧调度或 identity | `find_package(MeguvizMedia CONFIG REQUIRED)` 并链接 `MeguvizMedia::core`。参照 `examples/external_consumer`，从 `include/meguviz/media.h` 与实际用到的时间线或 cadence 头开始。 |
+| C/C++ 时间线、帧调度或 identity | `find_package(MeguvizMedia 1.2.1 CONFIG REQUIRED)` 并链接 `MeguvizMedia::core`。参照 `examples/external_consumer`，从 `include/meguviz/media.h` 与实际用到的时间线或 cadence 头开始。 |
 | Android identity | 使用已包含 Java API 的 `media-jni` AAR，调用 `MediaRuntime.loadPackagedIdentity()`。identity 可验证帧传递。 |
 | Android 播放器补帧 | 普通应用使用已包含 Java API 的 `media-rife-jni` AAR，经 `MediaRuntime.loadPackaged()` 加载。已有按需 loader 时选择同批 API-only 和 native payload，再用 `MediaRuntime.loadValidatedAbsolutePath()` 或 `attachAlreadyLoaded()`。每种消费者只选一种装配方式。 |
 
@@ -36,5 +36,5 @@ QCOM 是单独的可选 `libmeguviz_qcom_motion.so`。需要它时按 `docs/ADR-
   ctest --preset host-contracts --no-tests=error
   ```
 
-- Android 在 Windows 的 `android` 目录执行 `./gradlew.bat :media-api:testReleaseUnitTest :media-api:assembleRelease`，使用对应 JDK 和已安装的 Android SDK。现有组合包用 `python tools/mgv_integrate.py inspect-package --manifest <manifest.json> --out <新报告.json>` 检查。
+- Android 在 Windows 的 `android` 目录执行 `./gradlew.bat :media-api:testDebugUnitTest :media-api:assembleRelease`，使用对应 JDK 和已安装的 Android SDK。现有组合包用 `python tools/mgv_integrate.py inspect-package --manifest <manifest.json> --out <新报告.json>` 检查。
 - 对播放器用真实宿主连续播放、seek 和切清晰度，分别确认原帧与推理帧实际呈现、退役、音画同步。以同一时基记录呈现与音频；包检查、JVM 测试和离屏绘制各自只能证明对应范围。报告实际选择的后端、回退与测试结果。
