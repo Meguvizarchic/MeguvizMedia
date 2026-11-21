@@ -1,41 +1,26 @@
-# Failed model upload and deferred engine close
+# 模型上传失败与引擎延迟关闭机制
 
-`MediaNative.frameClose(handle)` requests close. It may return while GPU upload
-ownership or another retained consumer prevents native destruction. The native
-engine is marked closing, rejects newly admitted model/process operations and
-stays in the bounded registry until shutdown can finish. An operation admitted
-before closing may still finish. Closing does not forcibly reclaim another
-AndroidMediaSession or a consumer-owned output.
+本文说明 `MediaNative.frameClose`、`frameTryClose`、`frameLoad` 以及后台清理服务在模型权重上传失败与异步关闭场景下的所有权规则。
 
-Worker clients needing an explicit result can call `frameTryClose`: zero means
-the engine handle was removed, BUSY retains it for retry. The result is not a
-device reset or an interruption of a stuck driver. Some origin-resource cleanup
-may still block, so this is a worker API without a hard wall-clock guarantee.
+## 延迟关闭与显式轮询
 
-Failed `frameLoad` and failed nonidentity AndroidMediaSession construction can
-also leave abandoned upload owners without a live interpolation session. They
-request the same service as deferred close. A service success reclaims failed
-upload state; it does not turn the failed load into a successful model. Loading
-must be explicitly retried.
+调用 `MediaNative.frameClose(handle)` 只是发起关闭请求：当 GPU 上传任务尚未结束或仍有其他消费者持有资源时，该函数可能直接返回。此时底层引擎会进入关闭中状态，拒绝后续新提交的模型加载或图像处理请求，并留在有界注册表中直至清理能够完成。此前已接收的任务仍可继续完成；关闭某个引擎不会强行回收其他 `AndroidMediaSession` 或消费者持有的输出帧。
 
-The Java facade lazily creates one daemon service with at most one queued retry.
-Requests arriving during a native service call mark another pass necessary.
-BUSY retries back off to one second; completion shuts down the executor. There
-is no static native loading or automatic model retry. Scheduling/loader errors
-leave native ownership intact and expose a nonzero last-service status.
+若工作线程需要明确的关闭状态返回，可改用 `MediaNative.frameTryClose(handle)`：返回 `0` 表示引擎句柄已彻底移除；返回 `MGC_BUSY`（`-7`）表示仍有残留依赖，句柄会继续保留以供重试。由于部分源资源清理可能发生阻塞，该函数不提供硬实时壁钟上限，仅供工作线程调用（并非设备重置或强制打断卡死驱动的手段）。
 
-`frameServiceUploads(0, 0)` explicitly services this module's abandoned uploads
-and pending native closes. A nonzero handle services that engine. These entries
-remain available for manual worker service when automatic scheduling cannot
-start. The last Java service status describes that service observation, not
-complete graphics retirement, actual presentation or a release qualification.
+## 上传失败后的清理归属
 
-The matching library and API must stay loaded through successful close and API
-return. Dropping a Java backend handle is permitted because the native registry
-retains a pending close; it is not permission to unload its module. The official
-facade performs this handoff for existing BIL close callers.
+`MediaNative.frameLoad` 失败，以及非 Identity 类型的 `AndroidMediaSession` 构造失败时，即便没有返回可用的插帧会话，底层仍可能遗留正在执行的模型上传任务。这些失败路径会触发与延迟关闭相同的后台清理服务：
 
-The current service covers model-upload failures. Accepted inference retirement,
-GL/EGL recovery, JNI result delivery under allocation failure and external
-producer lifetimes keep their own gates. Their completion cannot be inferred
-from an empty upload registry.
+- 清理服务执行成功表示已回收失败的上传状态，**并不意味着**此前失败的模型已经加载成功，调用方必须显式重新执行加载流程。
+- Java 封装层会按需创建一个守护线程服务，队列最多保留一次待重试请求；若在原生清理调用期间收到新请求，则会标记需要再运行一轮。遇到繁忙状态时重试间隔退避至最高 1 秒，全部完成后关闭执行器（不提供静态原生加载或自动重加载模型功能）。调度或加载器报错时原生所有权仍保持完整，并通过 `frameRetirementServiceStatus()` 暴露非零状态码。
+
+## 手动清理接口与模块保活
+
+当自动调度无法启动时，工作线程可直接调用 `MediaNative.frameServiceUploads(handle, waitNs)` 推进清理：传入 `0` 清理本模块所有遗留上传与待关闭引擎，传入非零句柄仅清理对应引擎，`waitNs = 0` 表示非阻塞轮询。
+
+请注意，在关闭彻底完成且相关 API 返回之前，宿主必须始终保持匹配的原生动态库与 Java API 处于已加载状态。允许调用方在发起关闭后释放手里的 Java 句柄，因为底层注册表会负责接管待关闭对象，但这**绝不表示**可以立即卸载对应的动态库模块。
+
+## 适用范围与验证说明
+
+`frameRetirementServiceStatus()` 的结果以及上述清理机制仅覆盖模型上传失败与引擎延迟关闭状态，不代表整体图形管线结束、实际屏幕呈现或发布验收通过。已接受推理任务的回收、GL/EGL 上下文恢复、内存分配失败下的 JNI 结果交付以及外部生产者的资源生命周期，仍各自受对应的门禁与合同约束。

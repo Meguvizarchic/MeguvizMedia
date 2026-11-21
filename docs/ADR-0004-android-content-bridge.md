@@ -1,22 +1,30 @@
-# Android 内容桥与官方组合候选
+# Android 内容桥与官方组合设计说明
 
-本次实现是功能候选。真实 Android GPU 的 AHB 互操作、SYNC_FD、颜色、图像质量、生命周期、显示与 A/V 资格均未由编译结果证明。
+本文说明 `MeguvizMedia::android` 的底层资源生命周期、JNI 官方单一静态闭包构建方式，以及 `FrameGenerationSession` 统一中点补帧入口的接入与资源归属规则。
 
-`MeguvizMedia::android` 保留宿主 OES producer，在同一个专用共享 GL context 中按调用方提供的 SurfaceTexture/crop/rotation/flip 矩阵绘制自有全分辨率 RGBA8 AHardwareBuffer。未知/HDR/保护内容不进入这个 SDR/full-range 接口。源 producer 的内容租期需覆盖 capture 调用；Media 的自有 history 则由 Compute 最终内容 lease 的 callback 固定池槽，AHB 对象引用不能授权覆盖。allocation ID/generation 在物理重建时改变，content ID 每次写入递增。池容量 3–12，满时返回 BACKPRESSURE。
+## OES 内容桥与同期控制
 
-HOST_WAIT 用 EGL fence 的显式 client wait，再消费 Compute 的真实 Vulkan acquire/release、GENERAL/FOREIGN ownership 桥。GPU_SYNC 消费 binary native SYNC_FD；GL draw 后把采样完成 fence 登记为下次 Compute acquire dependency。未支持时调用明确拒绝，宿主再选择已资格回退。默认依旧是未启用的新路径，不能依据函数存在自动宣称支持。
+`MeguvizMedia::android` 在保留宿主 OES 生产者的前提下，于同一专用共享 GL 上下文中按照调用方传入的 `SurfaceTexture`/裁剪/旋转/翻转变换矩阵绘制自有全分辨率 `RGBA8` `AHardwareBuffer`。未知色彩、HDR 或受保护内容不会进入此 8 位 SDR 接口。
 
-RIFE 的 `AndroidMediaSession.compare()` 提供重复帧、静止和切镜判定，使用稀疏 RGBA 网格读回。同步插值路径也会执行这项采样。测量时计入读回字节、同步与耗时。RIFE 模型相关保护由 RIFE 执行，输出帧的诊断数据绑定到对应任务。
+- **输入与历史帧保活**：源生产者的内容租约须覆盖整个 `capture` 调用期间；Media 自有的历史帧槽位由 Compute 最终内容租约的回调固定，单纯持有 AHB 对象引用不代表可以安全覆写。
+- **版本与池容量**：`allocation_id` 与 `allocation_generation` 在底层物理重建时更新，`content_id` 每次写入递增；内部池容量范围为 3–12 槽，池满时返回 `MGC_BACKPRESSURE`（`-8`）且不接管输入所有权。
+- **同步模式**：
+  - `AHB_HOST_WAIT`：使用 EGL fence 显式客户端等待，再由 Compute 执行 Vulkan acquire/release 与 `GENERAL` / `FOREIGN` 所有权交接。
+  - `AHB_GPU_SYNC`：使用二进制 native `SYNC_FD`；GL 绘制结束后将采样完成 fence 登记为下一次 Compute acquire 依赖。若硬件或驱动不支持双向 fence，接口会直接返回拒绝状态，由宿主回退到已验证方案，绝不自动降级。
 
-AndroidMediaSession 在 GL owner 上捕获、呈现与收取结果。异步 submit 使用 RIFE 的已有 worker；native callback 只写最多三个结果的队列。准入 max-in-flight=1，使用最多 64 个成功的 admitted→sink-ready 联合服务时间样本的 p95 加安全余量。失败/取消不会作为快速成功样本。deadline admission 可独立关闭；过期输出拒绝和浅队列仍保留。旧 epoch 回调只物理回收，cancel/close 不提前释放输入或输出。C++ admission API 支持另外设置成本、百分位和队列上限。这里没有 actual-present 反馈，GLES draw/swap 只代表 sink submission。
+## 帧比较、调度与观测
 
-Compute、Media 和 RIFE 的 Android 组合通过 `MediaNative` 暴露 JNI。frameCreate/configure/load/process/close 保留旧状态码、ByteBuffer 和保护工具语义，内部调用 Compute/RIFE 公共 C API。测量 LEGACY_CPU_BRIDGE 时计入输入与输出拷贝。同一个宿主只使用一份 Compute/RIFE/ncnn 原生库组合。
+- **稀疏采样比对**：`AndroidMediaSession.compare()` 通过稀疏 RGBA 网格读回检测重复帧、静止画面与切镜，同步插值路径也会执行该采样；统计性能开销时须连同读回字节数与等待耗时一并计入。RIFE 相关图像保护由 RIFE 内核执行，诊断信息随任务绑定到输出帧。
+- **异步提交与有界排队**：`AndroidMediaSession` 在创建它的 EGL owner 线程上执行捕获、呈现和取帧。异步 `submit` 复用 RIFE 的工作线程，原生回调只向最多容纳 3 个结果的队列写入回执；调度器控制同一时间最多处理 1 个在途请求（`max_in_flight = 1`），默认基于最多 64 个成功完成（从接收到绘制就绪）的样本计算 p95 并叠加安全余量，失败或取消的任务不计入快速样本。
+- **过期与关闭约束**：可按需关闭截止时间检查，但过期输出丢弃与浅队列限制始终保留。旧 `epoch` 的回调仅用于驱动底层清理而不允许呈现；`cancel()` 或 `close()` 不会在任务结束前强行释放输入或输出资源。请注意，GLES `draw` 与 `eglSwapBuffers` 只表示提交到绘制槽位，并不等于屏幕实际显示完成反馈。
 
-distribution/android 直接组合三个静态项目、固定 ncnn 与仍保留的 runtime glslang，只链接一次 static STL，导出来自公共 headers 的 C API 与固定 JNI class。`tools/build_android_composition.py` 为每 ABI 从链接输出创建 canonical payload，再执行一次 `--strip-unneeded`；AGP 的 media-rife-jni 消费同一份 bytes 并关闭再次 strip。普通 app 使用该 JNI AAR；宿主按需加载使用 native-payload + 无 native 的 media-api AAR，两种 native owner 互斥。manifest 的 finalized 仅表示二进制规范化完成，不表示资格通过。ARMv7 保留 CPU 像素往返 + Vulkan NN 的 legacy bridge（同样支持原 fp16/flow/guard 配置）；其 AHB/sync 与实际设备资格另列。
+## JNI 官方单一静态闭包构建
 
-独立 sample-player 使用自身 MediaExtractor/MediaCodec → OES，已知 SDR 颜色时尝试相同 AHB identity 路径；不合格能力保留 OES 显示。该样例无音频，不是 A/V 验收。decoder AImageReader、SurfaceControl、HDR 都未混入默认路径。
+`MediaNative` 保留了原有的状态码、`ByteBuffer` 传参以及 `frameCreate`/`frameConfigure`/`frameLoad`/`frameProcess`/`frameClose` 接口语义，内部转调 Compute 与 RIFE 的公共 C API（统计 `LEGACY_CPU_BRIDGE` 时须把输入输出拷贝耗时算在内）。同一宿主进程中只能存在唯一一份 Compute/RIFE/ncnn 原生库。
 
-在 MeguvizMedia 仓库根目录运行以下命令。Android 模块使用 JDK 17 和 Android SDK 37，`minSdk` 为 27。组合构建需要同级的 MeguvizCompute、MeguvizRIFE 和 MeguvizShaderTools 源码目录。工具链安装位置不同的环境可给 Python 命令传入 `--ndk`、`--cmake` 和 `--ninja`。`meguviz.compositionDir` 相对于 `android` 项目根目录解析。
+`distribution/android` 将 `MeguvizCompute`、`MeguvizRIFE`、`MeguvizMedia`、固定版本的 `ncnn` 以及运行时 `glslang` 静态链接为单一闭包（仅链接一次 `c++_static`），只导出公共头文件中的 C API 与固定 JNI 类。`tools/build_android_composition.py` 为每个 ABI 生成规范化原生库并执行一次 `--strip-unneeded`，随后 `media-rife-jni` 直接消费这组未经二次裁剪的字节码；带有自研按需加载器的宿主则使用无原生库的 `media-api` AAR 搭配同批 `native-payload`（两种装配模式严禁混用）。清单中的 `finalized` 标记仅代表二进制构建与校验流程走完，不代表真机设备验收通过。
+
+在 `MeguvizMedia` 仓库根目录执行以下命令即可构建 Android 组件（要求 JDK 17、Android SDK 37、`minSdk 27` 以及同级的 `MeguvizCompute`、`MeguvizRIFE` 和 `MeguvizShaderTools` 源码目录，可选 `--ndk`、`--cmake`、`--ninja` 指定自定义工具链路径）：
 
 ```text
 android/gradlew.bat -p android :media-api:assembleRelease :media-api:testDebugUnitTest
@@ -24,24 +32,22 @@ python tools/build_android_composition.py --abi all --jvm-api android/media-api/
 android/gradlew.bat -p android -Pmeguviz.compositionDir=../artifacts/M6/android-composition :media-rife-jni:assembleRelease :sample-player:assembleDebug
 ```
 
-默认构建 `full` 算子配置，并在 Android API 23 及以上启用 APS2 重定位压缩。传入 `--ncnn-layer-profile rife46-arm64` 可在 ARM64 上启用锁定的 RIFE 4.6 算子配置，ARMv7 继续使用全量。`--ncnn-layer-profile rife46` 用于在两种 ABI 上验证裁层。进行重定位对照时，传入 `--packed-relocations off`。构建记录包含每种 ABI 实际使用的配置、算子清单和生成注册表的指纹。外部着色器包需要使用对应构建的私有 SDK 指纹。
-
-受控回退：应用停止新任务、取消/提升 epoch、继续 poll 直到 accepted 工作退役、释放 owned frames 与 GL 读取，close 成功后恢复宿主 OES/旧 ByteBuffer 路径。TIMEOUT/BUSY 时保留对象，不能强行释放 GPU 正在读取的资源。
+- 默认使用 `full` 算子配置，并在 Android API 23 及以上启用 APS2 动态重定位压缩。
+- 传入 `--ncnn-layer-profile rife46-arm64` 可仅在 `arm64-v8a` 上裁剪为 RIFE 4.6 所需算子、`armeabi-v7a` 保留全量；`--ncnn-layer-profile rife46` 用于双 ABI 裁剪对照；`--packed-relocations off` 用于关闭重定位压缩对照。若接入外部着色器包，须使用对应构建记录中的私有 SDK 指纹。
+- 独立 `android/sample-player` 通过自身的 `MediaExtractor` / `MediaCodec` → OES 链路验证同一套 AHB Identity 传递（不含音频同步，未知或不兼容格式自动回退纯 OES 显示）。
 
 ## RIFE 与 QCOM 的统一 Android 入口
 
-设备系列和公开驱动证据见 [Android GPU 补帧适配](ANDROID_GPU_COMPATIBILITY.md)。
+更多芯片与驱动参考见 [Android GPU 兼容性索引](ANDROID_GPU_COMPATIBILITY.md)。
 
-`FrameGenerationSession` 在持有当前 EGL 上下文的线程上完成 OES 采集、双帧中点提交、轮询、绘制和回收。RIFE 复用已准备好的 `AndroidMediaSession`。QCOM 复用紧凑 AHB 亮度及 GLES warp，并按输出尺寸映射源纹理坐标。QCOM 绘制到当前 EGL 绘制面对应的默认帧缓冲。后续宿主绘制按自己的要求重新设置 GLES 状态，窗口交换由宿主负责。
+`FrameGenerationSession` 在同一个持有当前 EGL 上下文的线程上串行完成 OES 采集、中点（`0.5`）双帧提交、轮询、绘制与释放：RIFE 复用准备好的 `AndroidMediaSession`；QCOM 复用紧凑 AHB 亮度缓冲与 GLES warp，并按输出尺寸映射纹理坐标、绘制到当前默认帧缓冲。窗口交换与后续状态恢复由宿主自行负责。
 
 ### 接入顺序
 
-1. **准备。** 根据源与输出尺寸、颜色、源帧和显示周期及中间帧预算创建 `FrameGenerationProfile`。在当前设备上完成能力和画质验证，再用 `profile.qualify()` 登记对应后端从帧对就绪到绘制提交的实测 p95。资格与创建它的 profile 实例绑定，也应随测量使用的后端配置一起管理。显示周期须短于源帧周期，两路均要求 8 位 SDR，QCOM 还要求 BT.709。尺寸、颜色、帧率或设备变化时重新建立会话并验证资格。
-2. **开启。** 在 EGL owner 上、逐帧循环之外调用 `open(profile, rife, preparedRife, flowScale, qcom)`。两路都合格时优先 RIFE。`preparedRife` 仅在选中 RIFE 时调用，返回的独占会话由统一会话接管，返回 `null` 则尝试已合格的 QCOM。缺少 QCOM 库、估计器或 AHB 预检失败会使 QCOM 路径不可用，`open()` 返回 `null` 时使用宿主原帧路径。
-3. **捕获和调度。** 在 EGL owner 上更新 `SurfaceTexture`，并为这次捕获取新的变换矩阵。`capture()` 的 `ptsUs` 是当前解码帧的媒体 PTS，单位为微秒。`trySubmit()` 的 `deadlineNs` 则是与 `System.nanoTime()` 同一时间基准的绝对截止时间。给源帧分配递增 ID，提交来自同一代且 PTS 递增的两个原帧。`capture()` 返回 `null` 时跳过补帧并继续原帧呈现。 [Android SurfaceTexture 参考](https://developer.android.com/reference/android/graphics/SurfaceTexture)
-4. **取帧和释放。** 在宿主已有的调度节拍上调用 `poll()`，同时推进底层资源回收。返回 `null` 表示当前没有回执。已接受任务到达截止时间且尚无回执时，`poll()` 会请求取消一次。任务仍占用槽位直至退役，过期输出会被丢弃。有输出帧时按宿主音视频时钟调度 `draw()`，并以 profile 的输出尺寸绘制。没有可用输出或绘制遇到 `WindowBackend.Backpressure` 时，由宿主兜底呈现原帧。`capture()` 和 `poll()` 交付的帧都需要在 owner 上 `release()` 一次，包括被跳过的帧。
-
-`trySubmit()` 提供逐帧准入原因。`ACCEPTED` 带正数 `jobId`，`IN_FLIGHT` 表示前一任务占用槽位，`DEADLINE` 表示剩余预算不足，`INPUT_NOT_READY` 表示输入尚未就绪，`BACKEND_REJECTED` 表示后端本次未接受。跳过后继续原帧，按宿主节拍再判断下一次机会。旧的 `submit()` 仍返回正数任务 ID 或 `0`。
+1. **构建 Profile 与登记实测指标**：根据源与输出分辨率、色彩空间、源帧周期、显示周期和单帧预算创建 `FrameGenerationProfile`（两路均要求 8 位 SDR 且显示周期短于源帧周期，QCOM 另要求 BT.709）。在目标设备上完成能力与画质检验后，通过 `qualify()` 或 `qualifyRife()` 登记实测的帧对到绘制提交 p95 耗时。格式、分辨率、帧率或设备发生变更时须重新创建会话与配置。
+2. **在热循环外开启会话**：在 EGL owner 线程上调用 `open(...)` 或 `openQualified(...)`。两路均合格时优先选用 RIFE；若 QCOM 动态库缺失或预检失败会自动跳过；若返回 `null`，宿主直接按原帧路径播放。
+3. **采集与入队调度**：在 EGL owner 线程更新 `SurfaceTexture` 后调用 `capture(oes, rawTransform, sourceId, ptsUs)`。`ptsUs` 为解码帧微秒时间戳，`sourceId` 与 `ptsUs` 须保持严格递增；`capture()` 内部已包含标准垂直翻转，调用方无需额外翻转矩阵。`trySubmit(left, right, deadlineNs)` 中的 `deadlineNs` 必须使用 `System.nanoTime()` 时基，返回的 `Submission.decision` 会明确区分 `IN_FLIGHT`、`DEADLINE`、`INPUT_NOT_READY` 与 `BACKEND_REJECTED`；一旦被拒绝或捕获失败，直接呈现宿主原帧。
+4. **轮询、绘制与归还**：按宿主节拍调用 `poll()` 推进任务完成和后台资源回收（达到截止时间且仍未返回时，`poll()` 会发出一次取消请求，但槽位仍会持续占用直到任务结束）。收到可用输出帧时按音画时钟调度 `draw()`；遇空结果或抛出 `WindowBackend.Backpressure` 时立刻切回原帧。无论是 `capture()` 还是 `poll()` 产出的帧对象，用完后都必须在 EGL owner 上调用一次 `release()`。
 
 ```java
 FrameGenerationSession.Submission submission = session.trySubmit(left, right, deadlineNs);
@@ -50,18 +56,15 @@ if (submission.jobId != 0) {
 }
 ```
 
-拖动或 PTS 回跳时调用 `invalidate()`，释放旧帧引用，并继续轮询已接受的任务直至终态回执。切清晰度或离开播放时停止提交，在同一 EGL owner 上释放帧引用后调用 `close()`。关闭可能等待后端回收，安排在逐帧循环之外。开始关闭后由 `close()` 推进回收。若暂时繁忙或回收未证明，保持会话、owner 与 EGL 上下文，待下一次 owner 调度再试。新会话就绪前恢复宿主原帧路径。
+### Seek 重置、精确选型与受控回退
 
-### 选择已验证的 RIFE 配置
+- **Seek 与关闭**：遇到 Seek 或时间戳跳变时调用 `invalidate()`，继续释放旧帧并持续 `poll()` 直至在途任务终态返回。切清晰度或退出播放时先停止提交并归还所有已持有的帧，再在同一个 EGL owner 上调用 `close()`；若因底层资源尚未回收而繁忙失败，**保留会话、owner 线程和 EGL 上下文**并在后续节拍重试，切勿强行销毁正在被 GPU 读取的资源。
+- **选择已验证的 RIFE 配置**：使用 `qualifyRife(...)` 登记各候选处理尺寸、同步路径与 `flowScale`，经 `selectRife(...)` 过滤超预算项并按“最大处理像素数 → 更细 flow → 更低 p95 → `AHB_HOST_WAIT`”择优。提交给 `openQualified(...)` 的 `AndroidMediaSession` 必须先在 EGL owner 上完成一次 `probe()`（`AHB_GPU_SYNC` 要求双向 fence 均通过）；**仅当 `openQualified` 返回后端为 `RIFE` 时才接管调用方传入的 session，若返回 `QCOM_AHB` 或 `null`，调用方须自行负责关闭释放该 `AndroidMediaSession`。**
 
-对每个已完成画质和负载验证的候选，用 `qualifyRife()` 登记处理宽高、AHB 同步路径、固定 flow 倍率和实测 p95。省略处理宽高时使用本 profile 的源尺寸。用 `selectRife()` 过滤过期和超预算资格，再按处理像素数、倍率和延时选择，完全同分优先 HOST_WAIT。
+### 可选 QCOM 库构建与校验
 
-用该资格的 `rifeWidth`、`rifeHeight` 和 `rifePath` 异步准备会话，另外传入原始源尺寸。提交后的会话先在 EGL owner 上调用一次 `probe()`，再将会话和资格交给 `openQualified()`。精确入口会核对已成功的 AHB 探测、源与处理尺寸、同步路径及是否为模型会话，并使用资格中的 `flowScale`。GPU_SYNC 资格需要双向围栏。只有返回 RIFE 时才接管已准备会话。调用方持有模型、精度、优化参数及设备代际的同配置实测记录，GL owner 上的打开操作不重新探测或等待后台工作。
+`libmeguviz_qcom_motion.so` 独立于 RIFE 组合包。可通过 [QCOM 构建脚本](../src/android/qcom_motion/build_so.py) 使用 NDK `30.0.16248370` 复现已验证的 `arm64-v8a` 库（`--ndk-bin` 指向工具链 `bin` 目录，`--out` 指向不含目标文件的输出目录）。宿主按 ABI 将该 `.so` 放入 `app/src/main/jniLibs/arm64-v8a/`，不破坏 RIFE 组合布局。打包后应检查 ELF 16 KB 页对齐与 APK ZIP 对齐（参见 [Android 16 KB 页兼容说明](https://developer.android.com/guide/practices/page-sizes)）。
 
-原有 `qualify()` 和 `open()` 供既有调用者使用。精确资格走 `openQualified()`。在模型、处理或输出尺寸、驱动或负载条件变化后重新验证。
+## 适用范围与验证说明
 
-### 可选 QCOM 打包与验收
-
-`libmeguviz_qcom_motion.so` 独立于 RIFE 组合。可通过 [QCOM 构建脚本](../src/android/qcom_motion/build_so.py) 用固定的 NDK `30.0.16248370` 复现已验证的 `arm64-v8a` 文件。`--ndk-bin` 指向 NDK 的 `toolchains/llvm/prebuilt/<host-tag>/bin`，`--out` 指向不含同名库的构建目录。宿主按 ABI 把库放到 `app/src/main/jniLibs/arm64-v8a/` 或其对应源集，保持 RIFE 组合的 manifest 和原生文件布局。最终发布包需检查原生库的 ELF 对齐，以及未压缩原生库在 APK 内的 ZIP 对齐。 [Android 16 KB 页兼容说明](https://developer.android.com/guide/practices/page-sizes)
-
-绘制回执只证明 GLES 提交。离屏测试可验证出帧、缩放、取消和回收。宿主启用前还需用真实窗口与音频测持续播放、骤切和遮挡画质、原帧连续性、功耗、拖动及切清晰度时的显示时序与音画同步。比较后端时记录投入帧对、准入跳过、过期结果和实际呈现的补帧数，与同素材的原帧播放对照。
+编译产物和离线包清单检验仅证明二进制格式与接口约束合规，不代表在真机设备上的 Android AHB 互操作、`SYNC_FD` 双向同步、16 KB 页运行、画质或音画同步已通过验证。正式上线前，须在目标真机和真实播放器窗口上完成连续播放、骤切、遮挡、Seek、切清晰度、热稳态及原帧对照实验。
